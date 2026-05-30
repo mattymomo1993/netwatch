@@ -2,6 +2,8 @@
 
 # NetWatch
 
+[![PyPI version](https://img.shields.io/pypi/v/netwatch-sec.svg)](https://pypi.org/project/netwatch-sec/)
+[![PyPI downloads](https://img.shields.io/pypi/dm/netwatch-sec.svg)](https://pypi.org/project/netwatch-sec/)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![Flask](https://img.shields.io/badge/Flask-2.3+-000000?logo=flask&logoColor=white)](https://flask.palletsprojects.com/)
@@ -67,6 +69,15 @@ Built for Raspberry Pi, Kali, Parrot OS, and any Debian-based Linux. Runs as a s
 
 ## Install
 
+**Quick install (from PyPI):**
+```bash
+sudo apt install -y nmap tshark tcpdump traceroute iproute2 iptables \
+                    openssl curl dnsutils whois psmisc arp-scan tor proxychains4
+pipx install netwatch-sec
+sudo netwatch
+```
+
+**From source:**
 ```bash
 # System tools (one-shot — covers all commands NetWatch shells out to)
 sudo apt install -y nmap tshark tcpdump traceroute iproute2 iptables \
