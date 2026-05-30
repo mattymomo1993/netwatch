@@ -1,0 +1,37 @@
+[MASTER]
+ignore = tests, docs, logs, ftp_root, .claude, dist, build
+
+[FORMAT]
+max-line-length = 200
+
+[MESSAGES CONTROL]
+# Silenced for this project — opinionated style/complexity rules that don't catch real bugs.
+disable =
+    C0111,  # missing-docstring (no module/class/function docstrings required)
+    C0114,  # missing-module-docstring
+    C0115,  # missing-class-docstring
+    C0116,  # missing-function-docstring
+    C0301,  # line-too-long (handled via max-line-length above)
+    C0302,  # too-many-lines (single-file design choice)
+    C0321,  # multiple-statements (intentional compact one-liners)
+    C0411,  # wrong-import-order (deferred imports for optional features)
+    C0415,  # import-outside-toplevel (intentional lazy imports)
+    R0902,  # too-many-instance-attributes
+    R0903,  # too-few-public-methods
+    R0911,  # too-many-return-statements
+    R0912,  # too-many-branches
+    R0913,  # too-many-arguments
+    R0914,  # too-many-locals
+    R0915,  # too-many-statements
+    R1714,  # consider-using-in (style)
+    R1732,  # consider-using-with (style — many cases don't apply)
+    W0511,  # fixme/TODO comments
+    W0602,  # global-variable-not-assigned (we use globals intentionally)
+    W0603,  # global-statement
+    W0611,  # unused-import (some are conditionally used)
+    W0612,  # unused-variable (sometimes intentional unpacking)
+    W0613,  # unused-argument (callback signatures)
+    W0706,  # try-except-raise (re-raise on purpose)
+    W0718,  # broad-exception-caught (defensive on user-facing surface)
+    W1510,  # subprocess-run-check (intentional: we inspect returncode where it matters)
+    W1514,  # unspecified-encoding (system is Linux UTF-8; explicit encoding adds noise)

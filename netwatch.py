@@ -19,6 +19,7 @@ import ssl
 import time
 import json
 import socket
+import select
 import struct
 import signal
 import random
@@ -927,7 +928,7 @@ def handle_ftp(client, addr):
 
             else:
                 ftp_log("UNKNOWN", cmd_line)
-                send(f"502 Command not implemented.")
+                send("502 Command not implemented.")
 
     except Exception as e:
         ftp_log("ERROR", str(e))
@@ -1844,7 +1845,7 @@ def _validate_target_url(url):
         resolved = socket.getaddrinfo(hostname, None)[0][4][0]
         addr = ipaddress.ip_address(resolved)
         if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved:
-            return False, f"refused: resolves to private IP"
+            return False, "refused: resolves to private IP"
     except Exception:
         return False, "DNS resolution failed"
     return True, ""
@@ -3373,13 +3374,13 @@ def _disp_report(parts):
         with lock:
             h = hosts.get(target, {})
         if h:
-            lines += [f"\nHOST DATA:", f"  Hostname: {resolve_host(target)}",
+            lines += ["\nHOST DATA:", f"  Hostname: {resolve_host(target)}",
                 f"  First seen: {h.get('first_seen', '?')}", f"  Last seen: {h.get('last_seen', '?')}",
                 f"  Bytes in: {format_bytes(h.get('bytes_in', 0))}", f"  Bytes out: {format_bytes(h.get('bytes_out', 0))}",
                 f"  Ports: {sorted(h.get('ports', set()))}", f"  Protocols: {sorted(h.get('protocols', set()))}"]
         if target in recon_reports:
             r = recon_reports[target]
-            lines += [f"\nRECON:", f"  OS: {r.get('os_guess', '?')}", f"  Open ports: {len(r.get('ports', []))}"]
+            lines += ["\nRECON:", f"  OS: {r.get('os_guess', '?')}", f"  Open ports: {len(r.get('ports', []))}"]
             lines += [f"    {p}" for p in r.get("ports", [])[:20]]
         with lock:
             hp = [e for e in honeypot_events if e["ip"] == target]
@@ -3389,7 +3390,7 @@ def _disp_report(parts):
         if target in ip_tags:
             lines.append(f"\nTAG: {ip_tags[target]}")
         if target in ip_notes:
-            lines.append(f"\nNOTES:")
+            lines.append("\nNOTES:")
             lines += [f"  {n}" for n in ip_notes[target]]
         report_file = os.path.join(LOG_DIR, f"report_{target.replace('.','_')}.txt")
         with open(report_file, "w") as f:
@@ -4265,7 +4266,7 @@ def _section_osint(limit=20):
             lines.append(f"  {DIM}{r['time']}{RESET}  {color}{r['type']:<6}{RESET} {r['target']:<24} {r['result']}")
     else:
         lines.append(f"  {DIM}(no results yet){RESET}")
-    lines.append(f"")
+    lines.append("")
     lines.append(f"  {DIM}Commands:{RESET}  {GREEN}geo{RESET} {GREEN}whois{RESET} {GREEN}dnsinfo{RESET} {GREEN}rdns{RESET} {GREEN}portscan{RESET} {GREEN}subnet{RESET} {GREEN}crt{RESET} {GREEN}headers{RESET} {GREEN}asn{RESET} {GREEN}abuse{RESET} {GREEN}ssl{RESET} {GREEN}secheaders{RESET} {GREEN}techstack{RESET} {GREEN}ping{RESET} {GREEN}health{RESET} {GREEN}etrace{RESET} <target>")
     return lines
 
@@ -6240,10 +6241,10 @@ def main():
         sys.exit(1)
 
     print(f"{BOLD}{RED}")
-    print(f"  ╔════════════════════════════════════════════╗")
+    print("  ╔════════════════════════════════════════════╗")
     print(f"  ║        NETWATCH v{VERSION}                     ║")
-    print(f"  ║   Network Security Dashboard               ║")
-    print(f"  ║   Honeypot + Traffic + tshark + nmap        ║")
+    print("  ║   Network Security Dashboard               ║")
+    print("  ║   Honeypot + Traffic + tshark + nmap        ║")
     print(f"  ╚════════════════════════════════════════════╝{RESET}")
     print(f"  {GREEN}Honeypot HTTP   : :8080{RESET}")
     print(f"  {GREEN}Honeypot Telnet : :2323{RESET}")
@@ -6369,8 +6370,7 @@ def main():
             def _parse_tunnel():
                 for line in _cf_proc.stdout:
                     if "trycloudflare.com" in line:
-                        import re as _re
-                        m = _re.search(r'https://[a-z0-9-]+\.trycloudflare\.com', line)
+                        m = re.search(r'https://[a-z0-9-]+\.trycloudflare\.com', line)
                         if m:
                             url = m.group(0)
                             print(f"  {GREEN}Remote Access   : {url}{RESET}")
@@ -6385,7 +6385,6 @@ def main():
         print(f"  {DIM}Tunnel          : cloudflared not found{RESET}")
 
     def _read_key(fd):
-        import select
         ch = os.read(fd, 1).decode('utf-8', errors='replace')
         if ch == '\x1b':
             seq = b""
