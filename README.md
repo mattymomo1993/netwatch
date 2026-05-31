@@ -4,6 +4,7 @@
 
 [![PyPI version](https://img.shields.io/pypi/v/netwatch-sec.svg)](https://pypi.org/project/netwatch-sec/)
 [![PyPI downloads](https://img.shields.io/pypi/dm/netwatch-sec.svg)](https://pypi.org/project/netwatch-sec/)
+[![Downloads](https://static.pepy.tech/badge/netwatch-sec)](https://pepy.tech/project/netwatch-sec)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![Flask](https://img.shields.io/badge/Flask-2.3+-000000?logo=flask&logoColor=white)](https://flask.palletsprojects.com/)
@@ -14,6 +15,7 @@
 [![Platform: Debian](https://img.shields.io/badge/platform-debian-A81D33?logo=debian&logoColor=white)](https://www.debian.org/)
 [![Tests](https://img.shields.io/badge/tests-1900-brightgreen.svg)](tests/)
 [![Status: Active](https://img.shields.io/badge/status-active-brightgreen.svg)]()
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-FFDD00?logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/pr0xy_22)
 
 **All-in-one network security dashboard** — deploy honeypots, capture traffic, run OSINT, scan targets, block threats, and forward alerts over mesh radio. One command, one file, real-time.
 
@@ -393,6 +395,12 @@ sudo systemctl enable --now netwatch
 ## Headless Mode
 
 No TTY detected (SSH pipe, systemd, Docker) = headless mode. Web dashboard only on `:9090`. All honeypots and traffic monitoring still active.
+
+## Support
+
+NetWatch is built and maintained solo. If it saves you time or protects your network, consider tipping — it keeps the lights on and pays for the tools that go into the next release.
+
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-FFDD00?logo=buy-me-a-coffee&logoColor=black&style=for-the-badge)](https://buymeacoffee.com/pr0xy_22)
 
 ## License
 
