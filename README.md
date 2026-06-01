@@ -43,7 +43,7 @@ Built for Raspberry Pi, Kali, Parrot OS, and any Debian-based Linux. Runs as a s
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│                     NETWATCH v1.0.0                          │
+│                     NETWATCH v1.1.0                          │
 ├──────────────────────────────────────────────────────────────┤
 │  TERMINAL UI (TUI)        │  WEB DASHBOARD (:9090)           │
 │  Full-screen ANSI         │  Flask + SSE live updates        │
@@ -380,7 +380,7 @@ Tested on Raspberry Pi 5, Parrot OS, and Termux (Android, passive mode).
 ## Deploy
 
 ```bash
-git clone https://github.com/<you>/netwatch.git && cd netwatch
+git clone https://github.com/Mattmorris-dev/netwatch-sec.git && cd netwatch-sec
 sudo apt install nmap tshark tcpdump traceroute
 pip3 install -r requirements.txt
 
