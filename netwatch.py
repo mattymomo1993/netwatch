@@ -632,15 +632,17 @@ def handle_ftp(client, addr):
     threading.Thread(target=_ftp_auto_recon, args=(ip,), daemon=True).start()
 
     def send(msg):
+        sent_ok = True
         try:
             client.send((msg + "\r\n").encode())
         except Exception:
-            pass
+            sent_ok = False
+        ftp_log("SERVER" if sent_ok else "SERVER_FAIL", msg)
 
     def ftp_log(direction, data):
-        """Log every single byte exchanged — JSON-safe, truncated"""
+        """Log every single byte exchanged — JSON-safe, truncated, newline-escaped"""
         ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-        safe_data = _ansi_strip(str(data)[:MAX_LOG_FIELD])
+        safe_data = _ansi_strip(str(data)[:MAX_LOG_FIELD]).replace("\r", "\\r").replace("\n", "\\n")
         entry = json.dumps({"ts": ts, "dir": direction, "data": safe_data})
         with _log_lock:
             with open(session_log, "a") as f:
@@ -652,7 +654,6 @@ def handle_ftp(client, addr):
 
     try:
         send("220 NVR-4200 FTP Service v4.3 Ready.")
-        ftp_log("SERVER", "220 banner sent")
         _ftp_cmd_count = 0
 
         while True:
@@ -682,7 +683,6 @@ def handle_ftp(client, addr):
                 username = arg
                 log_event("ftp_credential", ip, {"username": username, "stage": "USER"})
                 send(f"331 Password required for {username}.")
-                ftp_log("SERVER", f"331 password required for {username}")
 
             elif cmd == "PASS":
                 log_event("ftp_credential", ip, {
@@ -693,7 +693,6 @@ def handle_ftp(client, addr):
                 # Let them in to collect more intel
                 authenticated = True
                 send("230 Login successful.")
-                ftp_log("SERVER", "230 login ok (honeypot)")
 
                 with lock:
                     alerts.append({"time": datetime.now().strftime("%H:%M:%S"),
@@ -746,7 +745,8 @@ def handle_ftp(client, addr):
                 _pasv_ready.wait(timeout=5)
                 if data_sock:
                     try:
-                        data_sock.send(listing.encode())
+                        data_sock.sendall(listing.encode())
+                        ftp_log("DATA_SEND", f"LIST {len(listing)} bytes: {listing[:500]}")
                         data_sock.close()
                     except Exception:
                         pass
@@ -778,7 +778,9 @@ def handle_ftp(client, addr):
                     if data_sock:
                         try:
                             with open(real_path, "rb") as rf:
-                                data_sock.send(rf.read())
+                                file_data = rf.read()
+                            data_sock.sendall(file_data)
+                            ftp_log("DATA_SEND", f"RETR {filename} {len(file_data)} bytes from {real_path}")
                             data_sock.close()
                         except Exception:
                             pass
