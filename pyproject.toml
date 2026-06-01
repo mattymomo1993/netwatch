@@ -21,7 +21,7 @@ classifiers = [
     "Environment :: Console",
     "Intended Audience :: System Administrators",
     "Intended Audience :: Information Technology",
-    "License :: OSI Approved :: Apache Software License",
+    "License :: OSI Approved :: GNU Affero General Public License v3",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",
@@ -63,4 +63,4 @@ netwatch = "netwatch:main"
 py-modules = ["netwatch"]
 
 [tool.setuptools.packages.find]
-exclude = ["tests*", "docs*", "logs*", "ftp_root*", ".claude*"]
+exclude = ["tests*", "docs*", "logs*", "ftp_root*", ".claude*", "pro_beta*"]
