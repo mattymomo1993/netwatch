@@ -52,9 +52,9 @@ all = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/mattymomo1993/netwatch"
-Repository = "https://github.com/mattymomo1993/netwatch"
-Issues = "https://github.com/mattymomo1993/netwatch/issues"
+Homepage = "https://github.com/Mattmorris-dev/netwatch-sec"
+Repository = "https://github.com/Mattmorris-dev/netwatch-sec"
+Issues = "https://github.com/Mattmorris-dev/netwatch-sec/issues"
 
 [project.scripts]
 netwatch = "netwatch:main"
