@@ -46,6 +46,8 @@ try:
 except ImportError:
     dns = None
 
+import replay  # session-replay data layer (replay.py)
+
 # ─── Config ──────────────────────────────────────────────
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -5987,6 +5989,194 @@ def web_scan_log(ip):
     except Exception:
         pass
     return jsonify({"ip": ip, "scans": results})
+
+# -- SESSION REPLAY (uses replay.py data layer)
+
+@web_app.route("/replay")
+def web_replay_index():
+    return render_template_string(_REPLAY_INDEX_HTML)
+
+@web_app.route("/replay/<session_id>")
+def web_replay_player(session_id):
+    if not replay.SESSION_ID_RE.match(session_id):
+        return jsonify({"error": "invalid session_id"}), 400
+    return render_template_string(_REPLAY_PLAYER_HTML, session_id=session_id)
+
+@web_app.route("/api/replay")
+def web_replay_api_index():
+    return jsonify(replay.replay_index())
+
+@web_app.route("/api/replay/<session_id>")
+def web_replay_api_session(session_id):
+    if not replay.SESSION_ID_RE.match(session_id):
+        return jsonify({"error": "invalid session_id"}), 400
+    try:
+        timeline = replay.replay_loader(session_id)
+    except FileNotFoundError:
+        return jsonify({"error": "session not found"}), 404
+    timeline["intel"] = replay.load_intel(timeline["ip"])
+    return jsonify(timeline)
+
+_REPLAY_INDEX_HTML = r"""<!DOCTYPE html><html><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NetWatch · Replay sessions</title>
+<style>
+ body{background:#0a0e0a;color:#cfe;font:13px/1.4 ui-monospace,Menlo,Consolas,monospace;margin:0;padding:24px}
+ h1{color:#7df58a;font-weight:400;letter-spacing:1px;margin:0 0 4px}
+ .sub{color:#5a8;margin-bottom:24px;font-size:11px}
+ a{color:#7df58a;text-decoration:none}
+ a:hover{color:#fff;background:#143}
+ table{width:100%;border-collapse:collapse;margin-top:8px}
+ th{text-align:left;padding:6px 10px;color:#5a8;font-weight:400;border-bottom:1px solid #143;font-size:11px;text-transform:uppercase;letter-spacing:1px}
+ td{padding:6px 10px;border-bottom:1px solid #0f1a10}
+ tr:hover td{background:#0e1810}
+ .empty{padding:40px;text-align:center;color:#588}
+ .nav{margin-bottom:16px}
+ .nav a{padding:4px 10px;border:1px solid #2a4;border-radius:3px;margin-right:8px}
+ .ip{color:#fff}
+ .num{color:#999;text-align:right}
+</style></head><body>
+<div class="nav"><a href="/">← dashboard</a><a href="/replay" id="refresh">↻ refresh</a></div>
+<h1>SESSION REPLAY</h1>
+<div class="sub">Captured FTP honeypot sessions — click any session to scrub the timeline</div>
+<div id="content"><div class="empty">loading…</div></div>
+<script>
+async function load(){
+  const r=await fetch('/api/replay');
+  const sessions=await r.json();
+  const el=document.getElementById('content');
+  if(!sessions.length){el.innerHTML='<div class="empty">No sessions captured yet — once attackers hit the FTP honeypot, they\'ll appear here.</div>';return}
+  let h='<table><thead><tr><th>session id</th><th>attacker ip</th><th>captured</th><th>size</th></tr></thead><tbody>';
+  for(const s of sessions){
+    const ts=s.started_at_mtime.replace('T',' ').replace(/\..*/,'');
+    h+=`<tr><td><a href="/replay/${encodeURIComponent(s.session_id)}">${s.session_id}</a></td>`+
+       `<td class="ip">${s.ip}</td><td>${ts} UTC</td><td class="num">${s.size_bytes} B</td></tr>`;
+  }
+  el.innerHTML=h+'</tbody></table>';
+}
+load();
+document.getElementById('refresh').addEventListener('click',e=>{e.preventDefault();load()});
+</script>
+</body></html>"""
+
+_REPLAY_PLAYER_HTML = r"""<!DOCTYPE html><html><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NetWatch · Replay {{ session_id }}</title>
+<style>
+ body{background:#0a0e0a;color:#cfe;font:13px/1.4 ui-monospace,Menlo,Consolas,monospace;margin:0}
+ header{padding:14px 20px;border-bottom:1px solid #143;display:flex;align-items:center;gap:20px;flex-wrap:wrap}
+ header h1{color:#7df58a;font:400 14px/1 inherit;letter-spacing:2px;margin:0}
+ header .meta{color:#5a8;font-size:11px}
+ header .meta b{color:#fff;font-weight:400}
+ header a{color:#7df58a;text-decoration:none;padding:3px 8px;border:1px solid #2a4;border-radius:3px;font-size:11px}
+ main{display:grid;grid-template-columns:1fr 280px;height:calc(100vh - 130px)}
+ #events{overflow-y:auto;padding:12px 18px}
+ .ev{padding:3px 0;display:grid;grid-template-columns:70px 80px 1fr;gap:10px;border-radius:2px}
+ .ev .t{color:#588;font-size:11px}
+ .ev .k{font-size:11px;text-transform:uppercase;letter-spacing:1px}
+ .ev[data-k=server] .k{color:#7df58a}
+ .ev[data-k=server_fail] .k{color:#f55}
+ .ev[data-k=client] .k{color:#fc7}
+ .ev[data-k=cred] .k{color:#f9f}
+ .ev[data-k=upload] .k,.ev[data-k=upload_saved] .k,.ev[data-k=data_recv] .k{color:#9cf}
+ .ev[data-k=download] .k,.ev[data-k=data_send] .k{color:#9cf}
+ .ev[data-k=session_end] .k,.ev[data-k=quit] .k{color:#666}
+ .ev .x{color:#cfe;word-break:break-all;white-space:pre-wrap}
+ .ev.future{opacity:.18}
+ .ev.cursor{background:#143}
+ #intel{border-left:1px solid #143;padding:14px 16px;overflow-y:auto;background:#070b07}
+ #intel h2{color:#5a8;font:400 11px/1 inherit;letter-spacing:2px;text-transform:uppercase;margin:0 0 12px}
+ #intel dt{color:#588;font-size:11px;margin-top:10px;text-transform:uppercase;letter-spacing:1px}
+ #intel dd{color:#fff;margin:2px 0 0}
+ #intel .empty{color:#588;font-style:italic;font-size:11px}
+ footer{border-top:1px solid #143;padding:10px 18px;display:flex;align-items:center;gap:14px;background:#070b07}
+ footer button{background:#0a0e0a;color:#7df58a;border:1px solid #2a4;padding:4px 12px;border-radius:3px;cursor:pointer;font:inherit}
+ footer button:hover{background:#143;color:#fff}
+ footer button.active{background:#143;color:#fff}
+ #scrub{flex:1;height:6px;-webkit-appearance:none;background:#143;border-radius:3px;outline:none}
+ #scrub::-webkit-slider-thumb{-webkit-appearance:none;width:14px;height:14px;background:#7df58a;border-radius:50%;cursor:pointer}
+ #scrub::-moz-range-thumb{width:14px;height:14px;background:#7df58a;border-radius:50%;border:none;cursor:pointer}
+ #time{color:#fff;font-variant-numeric:tabular-nums;min-width:120px;text-align:right}
+ .err{color:#f55;padding:40px;text-align:center}
+</style></head><body>
+<header>
+ <h1>NETWATCH · REPLAY</h1>
+ <div class="meta">session <b id="sid">{{ session_id }}</b></div>
+ <div class="meta">ip <b id="ip">…</b></div>
+ <div class="meta">duration <b id="dur">…</b></div>
+ <a href="/replay">← all sessions</a>
+</header>
+<main>
+ <div id="events"><div class="err">loading…</div></div>
+ <div id="intel"><h2>ATTACKER INTEL</h2><div id="intelBody"><div class="empty">loading…</div></div></div>
+</main>
+<footer>
+ <button id="play">▶</button>
+ <button data-speed="1" class="active">1×</button>
+ <button data-speed="2">2×</button>
+ <button data-speed="4">4×</button>
+ <input type="range" id="scrub" min="0" max="0" value="0" step="1">
+ <span id="time">00:00 / 00:00</span>
+</footer>
+<script>
+const sid={{ session_id|tojson }};
+let timeline=null,cursor=0,playing=false,speed=1,timer=null,lastTick=0;
+function fmt(ms){const s=Math.floor(ms/1000),m=Math.floor(s/60);return `${String(m).padStart(2,'0')}:${String(s%60).padStart(2,'0')}`}
+function renderIntel(intel){
+ const b=document.getElementById('intelBody');
+ if(!intel||!intel.ip){b.innerHTML='<div class="empty">No OSINT recon yet for this IP. Run <code>recon</code> from the dashboard.</div>';return}
+ const rows=[['IP',intel.ip],['Country',intel.country],['City',intel.city],['ASN',intel.asn],['Org',intel.org],['Abuse',intel.abuse_score],['Hostname',intel.hostname]];
+ let h='<dl>';
+ for(const [k,v] of rows)if(v||v===0)h+=`<dt>${k}</dt><dd>${v}</dd>`;
+ if(intel.tags&&intel.tags.length)h+=`<dt>Tags</dt><dd>${intel.tags.join(', ')}</dd>`;
+ if(intel.notes)h+=`<dt>Notes</dt><dd>${intel.notes}</dd>`;
+ b.innerHTML=h+'</dl>';
+}
+function renderEvents(){
+ const el=document.getElementById('events');
+ if(!timeline.events.length){el.innerHTML='<div class="err">No events captured in this session (banner-only).</div>';return}
+ let h='',lastCursorIdx=-1;
+ for(let i=0;i<timeline.events.length;i++){
+  const e=timeline.events[i],fut=e.t_ms>cursor;
+  if(!fut)lastCursorIdx=i;
+  h+=`<div class="ev${fut?' future':''}" data-k="${e.kind}" data-i="${i}"><span class="t">${fmt(e.t_ms)}</span><span class="k">${e.kind}</span><span class="x">${e.text.replace(/</g,'&lt;')}</span></div>`;
+ }
+ el.innerHTML=h;
+ // mark cursor row + scroll to it
+ const cur=el.querySelector(`[data-i="${lastCursorIdx}"]`);
+ if(cur){cur.classList.add('cursor');cur.scrollIntoView({block:'nearest'})}
+}
+function updateScrubber(){
+ document.getElementById('scrub').value=cursor;
+ document.getElementById('time').textContent=`${fmt(cursor)} / ${fmt(timeline.duration_ms)}`;
+}
+function play(){playing=!playing;document.getElementById('play').textContent=playing?'❚❚':'▶';lastTick=performance.now();if(playing&&!timer)tick()}
+function tick(){
+ if(!playing){timer=null;return}
+ const now=performance.now(),dt=(now-lastTick)*speed;lastTick=now;
+ cursor=Math.min(timeline.duration_ms,cursor+dt);
+ updateScrubber();renderEvents();
+ if(cursor>=timeline.duration_ms){playing=false;document.getElementById('play').textContent='▶';timer=null;return}
+ timer=requestAnimationFrame(tick);
+}
+async function load(){
+ try{
+  const r=await fetch(`/api/replay/${encodeURIComponent(sid)}`);
+  if(!r.ok){document.getElementById('events').innerHTML=`<div class="err">${(await r.json()).error||'load failed'}</div>`;return}
+  timeline=await r.json();
+  document.getElementById('ip').textContent=timeline.ip;
+  document.getElementById('dur').textContent=fmt(timeline.duration_ms);
+  document.getElementById('scrub').max=Math.max(timeline.duration_ms,1);
+  renderIntel(timeline.intel);renderEvents();updateScrubber();
+ }catch(e){document.getElementById('events').innerHTML=`<div class="err">${e}</div>`}
+}
+document.getElementById('play').addEventListener('click',play);
+document.getElementById('scrub').addEventListener('input',e=>{cursor=parseInt(e.target.value,10);renderEvents();document.getElementById('time').textContent=`${fmt(cursor)} / ${fmt(timeline.duration_ms)}`});
+document.querySelectorAll('[data-speed]').forEach(b=>b.addEventListener('click',()=>{document.querySelectorAll('[data-speed]').forEach(x=>x.classList.remove('active'));b.classList.add('active');speed=parseFloat(b.dataset.speed)}));
+document.addEventListener('keydown',e=>{if(e.key===' '){e.preventDefault();play()}});
+load();
+</script>
+</body></html>"""
 
 # -- TIME-SERIES SAMPLING
 
