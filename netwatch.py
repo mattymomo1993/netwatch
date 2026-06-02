@@ -616,7 +616,8 @@ def ftp_honeypot(port=2121):
 def handle_ftp(client, addr):
     client.settimeout(60)
     ip = addr[0]
-    session_id = f"{ip}_{datetime.now().strftime('%H%M%S')}"
+    # microsecond suffix so back-to-back connects from one IP don't share a log file
+    session_id = f"{ip}_{datetime.now().strftime('%H%M%S_%f')}"
     session_log = os.path.join(LOG_DIR, f"ftp_session_{session_id}.log")
     cwd = "/"
     username = ""
@@ -667,7 +668,16 @@ def handle_ftp(client, addr):
                 raw = client.recv(4096)
                 if not raw:
                     break
-                cmd_line = raw.decode(errors="replace").strip()
+                # if the first few bytes aren't printable ASCII it's almost certainly
+                # a TLS ClientHello or other binary probe — log it as hex instead of
+                # decoding to mojibake. handshake bytes 0x16 0x03 0x0X are the giveaway.
+                head = raw[:4]
+                if any(b < 0x09 or (0x0e <= b < 0x20) or b >= 0x80 for b in head):
+                    preview = raw[:64].hex()
+                    ftp_log("CLIENT_BINARY", f"{len(raw)} bytes hex={preview}")
+                    send("502 Command not implemented.")
+                    continue
+                cmd_line = raw.decode("ascii", errors="replace").strip()
             except Exception:
                 break
 
@@ -869,7 +879,7 @@ def handle_ftp(client, addr):
                 passive_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 passive_sock.bind(("0.0.0.0", 0))
                 passive_sock.listen(1)
-                passive_sock.settimeout(10)
+                passive_sock.settimeout(5)
                 _, pasv_port = passive_sock.getsockname()
                 p1 = pasv_port >> 8
                 p2 = pasv_port & 0xFF
@@ -893,6 +903,10 @@ def handle_ftp(client, addr):
                             data_sock = None
                         else:
                             data_sock = conn
+                    except socket.timeout:
+                        # attacker requested PASV but never opened the data channel
+                        ftp_log("PASV_TIMEOUT", f"no data conn within 5s on port {pasv_port}")
+                        data_sock = None
                     except Exception:
                         data_sock = None
                     finally:
@@ -939,7 +953,8 @@ def handle_ftp(client, addr):
                     send(f"500 Unknown SITE command '{site_sub}'.")
 
             else:
-                ftp_log("UNKNOWN", cmd_line)
+                # CLIENT line already captured cmd_line; SERVER 502 below documents the reject.
+                # no need for a duplicate UNKNOWN entry.
                 send("502 Command not implemented.")
 
     except Exception as e:

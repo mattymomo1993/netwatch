@@ -323,6 +323,16 @@ mesh send <text>     mesh status     mesh nodes     mesh alert on/off
 
 All events logged to JSON with ANSI-stripped, sanitized data. Connection limits per service (50 max). FTP has path traversal protection and filename sanitization.
 
+### Session replay → GIF
+
+Turn any FTP session log into a watchable asciinema cast and GIF:
+
+```bash
+python3 tools/replay_to_gif.py logs/ftp_session_<ip>_<ts>.log demo.gif
+```
+
+Real attacker cadence preserved, idle stalls compressed. Requires [`agg`](https://github.com/asciinema/agg) for the GIF step.
+
 ## GraphQL API
 
 Available at `:9090/graphql` when `graphene` is installed.
