@@ -392,6 +392,8 @@ sudo cp netwatch.service /etc/systemd/system/
 sudo systemctl enable --now netwatch
 ```
 
+<a href="https://www.digitalocean.com/?refcode=acc36004569d&utm_campaign=Referral_Invite&utm_medium=Referral_Program&utm_source=badge"><img src="https://web-platforms.sfo2.cdn.digitaloceanspaces.com/WWW/Badge%203.svg" alt="DigitalOcean Referral Badge" /></a>
+
 ## Headless Mode
 
 No TTY detected (SSH pipe, systemd, Docker) = headless mode. Web dashboard only on `:9090`. All honeypots and traffic monitoring still active.
