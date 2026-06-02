@@ -1,12 +1,13 @@
 """NetWatch session replay — data layer.
 
-Reads captured FTP honeypot sessions from logs/ftp_session_*.log and exposes
-them as a unified timeline that the TUI and web dashboard can both render.
+Reads captured honeypot sessions (FTP per-session logs + synthesized Telnet
+sessions from telnet.json) and exposes them as a unified timeline that the
+TUI and web dashboard can both render.
 
 Public API:
-    replay_loader(session_id, log_dir=None) -> dict
-    replay_index(log_dir=None)              -> list[dict]
-    load_intel(ip, log_dir=None)            -> dict
+    replay_loader(session_id, protocol="ftp", log_dir=None) -> dict
+    replay_index(log_dir=None)                              -> list[dict]
+    load_intel(ip, log_dir=None)                            -> dict
 
 Read-only. No edits to underlying logs. Stdlib only, no new deps.
 """
@@ -94,55 +95,14 @@ def _anchor_date_for(path):
         return datetime.now(tz=timezone.utc).date()
 
 
-def replay_loader(session_id, log_dir=None):
-    """Return a unified, scrubbable timeline for one captured session.
-
-    Output:
-        {
-            "session_id": str,
-            "ip"        : str,
-            "started_at": ISO8601 UTC,
-            "ended_at"  : ISO8601 UTC,
-            "duration_ms": int,
-            "events"    : [
-                {"t_ms": int (offset from start),
-                 "kind": "client"|"server"|"server_fail"|"cred"|"data_send"|...,
-                 "text": str},
-                ...
-            ],
-        }
-
-    Raises FileNotFoundError if the session log isn't present, ValueError if
-    the session_id fails the regex guard.
-    """
-    _validate_session_id(session_id)
-    log_dir = _resolve_log_dir(log_dir)
-    path = _session_log_path(session_id, log_dir)
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"no session log: {path}")
-
-    ip = session_id.rsplit("_", 1)[0]
-    anchor = _anchor_date_for(path)
-    raw = []
-    with open(path) as f:
-        for line in f:
-            parsed = _parse_log_line(line)
-            if parsed is None:
-                continue
-            hms, direction, data = parsed
-            ms = _hhmmss_to_ms(hms, anchor)
-            if ms is None:
-                continue
-            raw.append((ms, direction.lower(), data))
-
+def _build_timeline(session_id, ip, raw):
+    """Sort (ms, kind, text) triples into a zero-anchored timeline dict."""
     if not raw:
         return {"session_id": session_id, "ip": ip,
                 "started_at": "", "ended_at": "",
                 "duration_ms": 0, "events": []}
-
     raw.sort(key=lambda x: x[0])
-    start_ms = raw[0][0]
-    end_ms = raw[-1][0]
+    start_ms, end_ms = raw[0][0], raw[-1][0]
     events = [{"t_ms": ms - start_ms, "kind": kind, "text": text}
               for ms, kind, text in raw]
     return {
@@ -157,10 +117,156 @@ def replay_loader(session_id, log_dir=None):
     }
 
 
-def replay_index(log_dir=None):
-    """List captured FTP sessions on disk, newest first.
+def _load_ftp_session(session_id, log_dir):
+    """Parse a per-session FTP log into (ms, kind, text) triples."""
+    path = _session_log_path(session_id, log_dir)
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"no session log: {path}")
+    ip = session_id.rsplit("_", 1)[0]
+    anchor = _anchor_date_for(path)
+    raw = []
+    with open(path) as f:
+        for line in f:
+            parsed = _parse_log_line(line)
+            if parsed is None:
+                continue
+            hms, direction, data = parsed
+            ms = _hhmmss_to_ms(hms, anchor)
+            if ms is None:
+                continue
+            raw.append((ms, direction.lower(), data))
+    return ip, raw
 
-    Output: list of {session_id, ip, started_at_mtime, size_bytes}.
+
+# Telnet sessions don't have per-session log files — they're synthesized from
+# `all_events.json` by grouping events from the same IP within a time gap.
+TELNET_SESSION_GAP_SEC = 300  # 5 min between events = new session
+_TELNET_SERVICES = {"telnet", "telnet_cmd", "malware_attempt"}
+
+
+def _iter_telnet_events(log_dir):
+    """Yield (timestamp_iso, ip, service, data) from all_events.json."""
+    path = os.path.join(log_dir, "all_events.json")
+    if not os.path.exists(path):
+        return
+    with open(path) as f:
+        for line in f:
+            try:
+                e = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if e.get("service") not in _TELNET_SERVICES:
+                continue
+            ts = e.get("timestamp", "")
+            ip = e.get("source_ip", "")
+            if not ts or not ip:
+                continue
+            yield ts, ip, e.get("service", ""), e.get("data") or {}
+
+
+def _format_telnet_event(service, data):
+    """Render a telnet event into (kind, text) for the timeline."""
+    if service == "telnet":
+        u = data.get("username", "")
+        p = data.get("password", "")
+        if u or p:
+            return "login", f"{u or '∅'} : {p or '∅'}"
+        return "connect", f"port={data.get('port','?')}"
+    if service == "telnet_cmd":
+        return "cmd", data.get("command", "")[:200]
+    if service == "malware_attempt":
+        return "malware", data.get("command", "")[:200]
+    return service, str(data)[:200]
+
+
+def _group_telnet_sessions(log_dir):
+    """Group telnet.* events into synthetic sessions keyed by (ip, first_ts).
+
+    Returns dict: session_id -> {"ip", "first_ms", "raw": [(ms, kind, text)]}.
+    A session ends when there's a gap > TELNET_SESSION_GAP_SEC from the same IP.
+    """
+    by_ip = {}
+    for ts, ip, service, data in _iter_telnet_events(log_dir):
+        try:
+            dt = datetime.fromisoformat(ts)
+        except ValueError:
+            continue
+        ms = int(dt.timestamp() * 1000)
+        kind, text = _format_telnet_event(service, data)
+        by_ip.setdefault(ip, []).append((ms, kind, text))
+
+    sessions = {}
+    for ip, events in by_ip.items():
+        events.sort(key=lambda x: x[0])
+        cur_first = None
+        cur_last = None
+        bucket = []
+        for ms, kind, text in events:
+            if cur_first is None or (ms - cur_last) > TELNET_SESSION_GAP_SEC * 1000:
+                # close previous bucket
+                if bucket:
+                    _flush_telnet_bucket(sessions, ip, cur_first, bucket)
+                cur_first = ms
+                bucket = []
+            cur_last = ms
+            bucket.append((ms, kind, text))
+        if bucket:
+            _flush_telnet_bucket(sessions, ip, cur_first, bucket)
+    return sessions
+
+
+def _flush_telnet_bucket(sessions, ip, first_ms, bucket):
+    hhmmss = datetime.fromtimestamp(first_ms / 1000, tz=timezone.utc).strftime("%H%M%S")
+    sid = f"{ip}_{hhmmss}"
+    sessions[sid] = {"ip": ip, "first_ms": first_ms, "raw": bucket}
+
+
+def _load_telnet_session(session_id, log_dir):
+    sessions = _group_telnet_sessions(log_dir)
+    s = sessions.get(session_id)
+    if s is None:
+        raise FileNotFoundError(f"no telnet session: {session_id}")
+    return s["ip"], s["raw"]
+
+
+def replay_loader(session_id, protocol="ftp", log_dir=None):
+    """Return a unified, scrubbable timeline for one captured session.
+
+    Output:
+        {
+            "session_id" : str,
+            "ip"         : str,
+            "protocol"   : "ftp" | "telnet",
+            "started_at" : ISO8601 UTC,
+            "ended_at"   : ISO8601 UTC,
+            "duration_ms": int,
+            "events"     : [
+                {"t_ms": int, "kind": str, "text": str},
+                ...
+            ],
+        }
+
+    Raises FileNotFoundError if the session isn't present, ValueError if the
+    session_id fails the regex guard or protocol is unknown.
+    """
+    _validate_session_id(session_id)
+    log_dir = _resolve_log_dir(log_dir)
+    if protocol == "ftp":
+        ip, raw = _load_ftp_session(session_id, log_dir)
+    elif protocol == "telnet":
+        ip, raw = _load_telnet_session(session_id, log_dir)
+    else:
+        raise ValueError(f"unknown protocol: {protocol!r}")
+    out = _build_timeline(session_id, ip, raw)
+    out["protocol"] = protocol
+    return out
+
+
+def replay_index(log_dir=None):
+    """List captured sessions (FTP + Telnet) newest first.
+
+    Output: list of {session_id, ip, protocol, started_at_mtime, event_count}.
+    `event_count` is bytes for FTP (rough proxy) or message count for Telnet.
     Cached for 5 seconds — repeated dashboard polls don't re-walk logs/.
     """
     log_dir = _resolve_log_dir(log_dir)
@@ -172,12 +278,12 @@ def replay_index(log_dir=None):
             return _index_cache["data"]
 
     out = []
+    # FTP — per-session log files on disk
     try:
         names = os.listdir(log_dir)
     except OSError:
         names = []
-    prefix = "ftp_session_"
-    suffix = ".log"
+    prefix, suffix = "ftp_session_", ".log"
     for name in names:
         if not (name.startswith(prefix) and name.endswith(suffix)):
             continue
@@ -192,10 +298,23 @@ def replay_index(log_dir=None):
         out.append({
             "session_id": session_id,
             "ip": session_id.rsplit("_", 1)[0],
+            "protocol": "ftp",
             "started_at_mtime": datetime.fromtimestamp(
                 st.st_mtime, tz=timezone.utc).isoformat(),
-            "size_bytes": st.st_size,
+            "event_count": st.st_size,
         })
+
+    # Telnet — synthesized from all_events.json
+    for sid, info in _group_telnet_sessions(log_dir).items():
+        out.append({
+            "session_id": sid,
+            "ip": info["ip"],
+            "protocol": "telnet",
+            "started_at_mtime": datetime.fromtimestamp(
+                info["first_ms"] / 1000, tz=timezone.utc).isoformat(),
+            "event_count": len(info["raw"]),
+        })
+
     out.sort(key=lambda r: r["started_at_mtime"], reverse=True)
     with _cache_lock:
         _index_cache.update({"at": now, "data": out, "dir": log_dir})

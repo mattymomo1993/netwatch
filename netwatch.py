@@ -5996,11 +5996,17 @@ def web_scan_log(ip):
 def web_replay_index():
     return render_template_string(_REPLAY_INDEX_HTML)
 
+def _replay_proto_arg():
+    p = (request.args.get("proto") or "ftp").lower()
+    return p if p in ("ftp", "telnet") else "ftp"
+
 @web_app.route("/replay/<session_id>")
 def web_replay_player(session_id):
     if not replay.SESSION_ID_RE.match(session_id):
         return jsonify({"error": "invalid session_id"}), 400
-    return render_template_string(_REPLAY_PLAYER_HTML, session_id=session_id)
+    return render_template_string(_REPLAY_PLAYER_HTML,
+                                  session_id=session_id,
+                                  protocol=_replay_proto_arg())
 
 @web_app.route("/api/replay")
 def web_replay_api_index():
@@ -6011,9 +6017,11 @@ def web_replay_api_session(session_id):
     if not replay.SESSION_ID_RE.match(session_id):
         return jsonify({"error": "invalid session_id"}), 400
     try:
-        timeline = replay.replay_loader(session_id)
+        timeline = replay.replay_loader(session_id, protocol=_replay_proto_arg())
     except FileNotFoundError:
         return jsonify({"error": "session not found"}), 404
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
     timeline["intel"] = replay.load_intel(timeline["ip"])
     return jsonify(timeline)
 
@@ -6035,22 +6043,27 @@ _REPLAY_INDEX_HTML = r"""<!DOCTYPE html><html><head>
  .nav a{padding:4px 10px;border:1px solid #2a4;border-radius:3px;margin-right:8px}
  .ip{color:#fff}
  .num{color:#999;text-align:right}
+ .proto{font-size:10px;padding:1px 6px;border-radius:2px;text-transform:uppercase;letter-spacing:1px}
+ .proto.ftp{background:#143;color:#7df58a}
+ .proto.telnet{background:#311;color:#f87}
 </style></head><body>
 <div class="nav"><a href="/">← dashboard</a><a href="/replay" id="refresh">↻ refresh</a></div>
 <h1>SESSION REPLAY</h1>
-<div class="sub">Captured FTP honeypot sessions — click any session to scrub the timeline</div>
+<div class="sub">Captured honeypot sessions — click any session to scrub the timeline</div>
 <div id="content"><div class="empty">loading…</div></div>
 <script>
 async function load(){
   const r=await fetch('/api/replay');
   const sessions=await r.json();
   const el=document.getElementById('content');
-  if(!sessions.length){el.innerHTML='<div class="empty">No sessions captured yet — once attackers hit the FTP honeypot, they\'ll appear here.</div>';return}
-  let h='<table><thead><tr><th>session id</th><th>attacker ip</th><th>captured</th><th>size</th></tr></thead><tbody>';
+  if(!sessions.length){el.innerHTML='<div class="empty">No sessions captured yet — once attackers hit a honeypot, they\'ll appear here.</div>';return}
+  let h='<table><thead><tr><th>session id</th><th>proto</th><th>attacker ip</th><th>captured</th><th>events</th></tr></thead><tbody>';
   for(const s of sessions){
     const ts=s.started_at_mtime.replace('T',' ').replace(/\..*/,'');
-    h+=`<tr><td><a href="/replay/${encodeURIComponent(s.session_id)}">${s.session_id}</a></td>`+
-       `<td class="ip">${s.ip}</td><td>${ts} UTC</td><td class="num">${s.size_bytes} B</td></tr>`;
+    const proto=s.protocol||'ftp';
+    h+=`<tr><td><a href="/replay/${encodeURIComponent(s.session_id)}?proto=${proto}">${s.session_id}</a></td>`+
+       `<td><span class="proto ${proto}">${proto}</span></td>`+
+       `<td class="ip">${s.ip}</td><td>${ts} UTC</td><td class="num">${s.event_count}</td></tr>`;
   }
   el.innerHTML=h+'</tbody></table>';
 }
@@ -6120,6 +6133,7 @@ _REPLAY_PLAYER_HTML = r"""<!DOCTYPE html><html><head>
 </footer>
 <script>
 const sid={{ session_id|tojson }};
+const proto={{ protocol|tojson }};
 let timeline=null,cursor=0,playing=false,speed=1,timer=null,lastTick=0;
 function fmt(ms){const s=Math.floor(ms/1000),m=Math.floor(s/60);return `${String(m).padStart(2,'0')}:${String(s%60).padStart(2,'0')}`}
 function renderIntel(intel){
@@ -6161,7 +6175,7 @@ function tick(){
 }
 async function load(){
  try{
-  const r=await fetch(`/api/replay/${encodeURIComponent(sid)}`);
+  const r=await fetch(`/api/replay/${encodeURIComponent(sid)}?proto=${proto}`);
   if(!r.ok){document.getElementById('events').innerHTML=`<div class="err">${(await r.json()).error||'load failed'}</div>`;return}
   timeline=await r.json();
   document.getElementById('ip').textContent=timeline.ip;

