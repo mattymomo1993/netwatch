@@ -50,3 +50,4 @@ tools/keygen_private.key
 # Pro tier — private, do not publish
 pro_beta/
 netwatch
+pro_beta_snapshots/
