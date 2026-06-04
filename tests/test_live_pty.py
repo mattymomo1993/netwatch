@@ -113,7 +113,7 @@ class TestDashboardClean:
         frame = netwatch._build_frame(cols=100, max_content=30)
         text = "\n".join(strip_ansi(l) for l in frame)
         assert "NETWATCH" in text
-        assert "1.0.0" in text
+        assert "1.1.0" in text
 
     def test_dashboard_shows_tab_bar(self):
         frame = netwatch._build_frame(cols=100, max_content=30)

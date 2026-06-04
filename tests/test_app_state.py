@@ -16,6 +16,7 @@ from netwatch import (
     SCREEN_DASHBOARD,
     SCREEN_CLI,
     SCREEN_CONSOLE,
+    SCREEN_REPLAY,
     SCREENS,
     app_state,
 )
@@ -52,7 +53,7 @@ class TestAppStateDataclass:
         assert s.needs_clear is True
 
     def test_screens_constant(self):
-        assert SCREENS == (SCREEN_DASHBOARD, SCREEN_CLI, SCREEN_CONSOLE)
+        assert SCREENS == (SCREEN_DASHBOARD, SCREEN_CLI, SCREEN_CONSOLE, SCREEN_REPLAY)
 
     def test_module_has_singleton_app_state(self):
         assert isinstance(netwatch.app_state, AppState)
