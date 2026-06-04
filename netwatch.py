@@ -4914,16 +4914,25 @@ def _web_auth():
         for _lip in LOCAL_IPS:
             _allowed_origins.add(f"http://{_lip}:{WEB_PORT}")
         _cf_origin = os.environ.get("NETWATCH_CF_ORIGIN", "")
+        # Loopback on any port — SSH tunnels remap ports (e.g. -L 9091:127.0.0.1:9090)
+        # and the same-origin policy already prevents foreign sites from issuing these.
+        _origin_lc = origin.lower()
+        _loopback_any_port = (_origin_lc.startswith("http://localhost:")
+                              or _origin_lc.startswith("http://127.0.0.1:"))
         if _cf_origin and origin == f"https://{_cf_origin}":
             pass
         elif origin.startswith("https://") and origin.endswith(".trycloudflare.com") and _verify_web_cookie(request.cookies.get("nw_token", "")):
+            pass
+        elif _loopback_any_port and _verify_web_cookie(request.cookies.get("nw_token", "")):
             pass
         elif origin not in _allowed_origins:
             return "CSRF rejected", 403
 
 @web_app.after_request
 def _security_headers(resp):
-    resp.headers["X-Frame-Options"] = "DENY"
+    # SAMEORIGIN allows the dashboard to embed /replay/<sid> in an iframe
+    # while still blocking cross-site framing (clickjacking protection).
+    resp.headers["X-Frame-Options"] = "SAMEORIGIN"
     resp.headers["X-Content-Type-Options"] = "nosniff"
     resp.headers["Referrer-Policy"] = "no-referrer"
     resp.headers["Cache-Control"] = "no-store"
@@ -6569,6 +6578,12 @@ async function load(){
   document.getElementById('ip').textContent=timeline.ip;
   document.getElementById('dur').textContent=fmt(timeline.duration_ms);
   document.getElementById('scrub').max=Math.max(timeline.duration_ms,1);
+  // Auto-slow sub-2-second captures so playback is actually visible
+  // (many FTP probes are sub-100ms TLS handshakes that would flash past).
+  if(timeline.duration_ms>0 && timeline.duration_ms<2000){
+    setSpeed(0.25);
+    document.getElementById('dur').title='Auto-slowed to 0.25× — session is under 2s';
+  }
   renderIntel(timeline.intel);renderEvents();updateScrubber();
  }catch(e){document.getElementById('events').innerHTML=`<div class="err">${esc(e)}</div>`}
 }
