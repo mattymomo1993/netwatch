@@ -2423,7 +2423,8 @@ from dataclasses import dataclass
 SCREEN_DASHBOARD = "dashboard"
 SCREEN_CLI = "cli"
 SCREEN_CONSOLE = "console"
-SCREENS = (SCREEN_DASHBOARD, SCREEN_CLI, SCREEN_CONSOLE)
+SCREEN_REPLAY = "replay"
+SCREENS = (SCREEN_DASHBOARD, SCREEN_CLI, SCREEN_CONSOLE, SCREEN_REPLAY)
 
 
 def _get_terminal_dims():
@@ -2458,6 +2459,14 @@ class AppState:
     dash_focus: int = 0
     last_screen: str = SCREEN_DASHBOARD  # toggle-back target
     needs_clear: bool = False  # one-shot \033[2J before next paint
+    # Replay screen state (None until a session is loaded)
+    replay_session_id: str = ""
+    replay_protocol: str = "ftp"          # "ftp" | "telnet"
+    replay_timeline: dict = None          # dict from replay.replay_loader(); intel attached under 'intel'
+    replay_cursor_ms: int = 0
+    replay_playing: bool = False
+    replay_speed: float = 1.0             # 0.25 / 0.5 / 1 / 2 / 4 / 8
+    replay_last_tick: float = 0.0         # time.monotonic() of last advance
 
     def switch(self, target: str) -> None:
         if target not in SCREENS or target == self.current_screen:
