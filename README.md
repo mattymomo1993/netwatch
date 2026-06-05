@@ -126,6 +126,41 @@ From the TUI prompt:
 | `rotate-key` | Generate a new Fernet key — invalidates all active web sessions. Persisted to `~/.config/netwatch/web.key`. |
 | `rotate-token` | Generate a new auth token — invalidates all sessions. Re-written to `~/.config/netwatch/token` (0600). |
 
+### Honeypot ports
+
+Defaults bind to high ports so root isn't required: HTTP `:8080`, Telnet `:2323`, FTP `:2121`, RTSP `:8554`. Override via env to move to standard ports (needs `CAP_NET_BIND_SERVICE` or root):
+
+```bash
+NETWATCH_HTTP_PORT=80 \
+NETWATCH_TELNET_PORT=23 \
+NETWATCH_FTP_PORT=21 \
+NETWATCH_RTSP_PORT=554 \
+sudo -E netwatch
+```
+
+Persist by adding to `/etc/netwatch.env` and referencing in the systemd unit's `EnvironmentFile=`. Internet-facing scanners hit the standard ports — non-standard ports stay invisible to most drive-by traffic.
+
+### CrowdSec auto-ban (optional)
+
+If [`cscli`](https://docs.crowdsec.net/) is installed on the host, every honeypot capture (`credential`, `telnet`, `ftp`, `rtsp`, `malware_attempt`, `ftp_upload`, `telnet_cmd`) automatically calls `cscli decisions add` with a 4h ban. The CrowdSec firewall bouncer enforces the drop via ipset, so the rule count never blows up. Same-IP events within 60s are deduped. Set `NETWATCH_AUTODEFEND=0` to disable. With no CrowdSec installed, the hook silently no-ops.
+
+Install on Debian:
+
+```bash
+curl -s https://install.crowdsec.net | sudo sh
+sudo apt install -y crowdsec crowdsec-firewall-bouncer-iptables
+sudo systemctl enable --now crowdsec crowdsec-firewall-bouncer
+```
+
+Whitelist your operator IP so you don't ban yourself — add `/etc/crowdsec/parsers/s02-enrich/whitelists.yaml`:
+
+```yaml
+name: netwatch/operator-whitelist
+whitelist:
+  reason: "operator home"
+  ip: ["<your-public-ip>"]
+```
+
 ## Remote Access
 
 When `cloudflared` is available, NetWatch starts a quick tunnel automatically at launch. The public `*.trycloudflare.com` URL is printed at startup and pinned to the top of the **all** tab on the dashboard so you can copy it without scrolling through alerts.
