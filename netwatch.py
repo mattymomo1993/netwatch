@@ -3,7 +3,8 @@
 NetWatch v2.0 - Unified Network Security Dashboard
 ════════════════════════════════════════════════════
 Modules:
-  HONEYPOT  - Fake NVR panel (:8080), DVR telnet (:2323), RTSP camera (:8554)
+  HONEYPOT  - Fake NVR panel, DVR telnet, RTSP camera, FTP bait
+              (defaults :8080/:2323/:2121/:8554, override via NETWATCH_*_PORT env)
   TRAFFIC   - Live packet capture via tshark + raw sockets
   SCANNER   - On-demand nmap scans from dashboard
   CAPTURE   - tcpdump pcap recording
@@ -69,6 +70,14 @@ for _i, _a in enumerate(sys.argv):
         _cli_token = sys.argv[_i + 1]
         break
 VERSION = "1.1.0"
+
+# Honeypot listener ports — overridable via env so deployments can move to
+# standard ports (80/23/21/554) without local sed against the repo.
+# CAP_NET_BIND_SERVICE or root required for ports <1024.
+HTTP_PORT   = int(os.environ.get("NETWATCH_HTTP_PORT",   "8080"))
+TELNET_PORT = int(os.environ.get("NETWATCH_TELNET_PORT", "2323"))
+FTP_PORT    = int(os.environ.get("NETWATCH_FTP_PORT",    "2121"))
+RTSP_PORT   = int(os.environ.get("NETWATCH_RTSP_PORT",   "8554"))
 
 # ─── Colors ──────────────────────────────────────────────
 
@@ -494,7 +503,8 @@ def _honeypot_listener(service, port, handler):
         except Exception:
             pass
 
-def telnet_honeypot(port=2323):
+def telnet_honeypot(port=None):
+    if port is None: port = TELNET_PORT
     _honeypot_listener("telnet", port, handle_telnet)
 
 def handle_telnet(client, addr):
@@ -569,7 +579,8 @@ def handle_telnet(client, addr):
 
 # -- HONEYPOT - RTSP
 
-def rtsp_honeypot(port=8554):
+def rtsp_honeypot(port=None):
+    if port is None: port = RTSP_PORT
     _honeypot_listener("rtsp", port, handle_rtsp)
 
 def handle_rtsp(client, addr):
@@ -610,7 +621,8 @@ FTP_FILES = {
     "/logs": ["access.log", "auth.log", "system.log"],
 }
 
-def ftp_honeypot(port=2121):
+def ftp_honeypot(port=None):
+    if port is None: port = FTP_PORT
     _honeypot_listener("ftp", port, handle_ftp)
 
 def handle_ftp(client, addr):
@@ -4431,8 +4443,8 @@ def _build_frame(cols=80, max_content=35, active_tab=None):
 
     # Services
     svcs = [
-        ("HTTP:8080", GREEN), ("TELNET:2323", GREEN),
-        ("FTP:2121", GREEN), ("RTSP:8554", GREEN),
+        (f"HTTP:{HTTP_PORT}", GREEN), (f"TELNET:{TELNET_PORT}", GREEN),
+        (f"FTP:{FTP_PORT}", GREEN), (f"RTSP:{RTSP_PORT}", GREEN),
         (f"SNIFF:{IFACE}", GREEN),
     ]
     tshark_ok = len(tshark_conversations) > 0
@@ -6951,9 +6963,9 @@ def main():
     print("  ║   Honeypot + Traffic + tshark + nmap        ║")
     print(f"  ╚════════════════════════════════════════════╝{RESET}")
     print(f"  {GREEN}Honeypot HTTP   : :8080{RESET}")
-    print(f"  {GREEN}Honeypot Telnet : :2323{RESET}")
-    print(f"  {GREEN}Honeypot FTP    : :2121  (bait files + keystroke log){RESET}")
-    print(f"  {GREEN}Honeypot RTSP   : :8554{RESET}")
+    print(f"  {GREEN}Honeypot Telnet : :{TELNET_PORT}{RESET}")
+    print(f"  {GREEN}Honeypot FTP    : :{FTP_PORT}  (bait files + keystroke log){RESET}")
+    print(f"  {GREEN}Honeypot RTSP   : :{RTSP_PORT}{RESET}")
     print(f"  {GREEN}Traffic Sniffer : {IFACE}{RESET}")
     print(f"  {GREEN}tshark Protocol : {IFACE}{RESET}")
     print(f"  {GREEN}tcpdump Capture : {PCAP_DIR}/{RESET}")
@@ -7011,17 +7023,19 @@ def main():
             except Exception:
                 pass
         save_logs()
-        subprocess.run(["fuser", "-k", "2323/tcp", "8554/tcp", "8080/tcp",
-                        "2121/tcp", "9090/tcp"], capture_output=True)
+        subprocess.run(["fuser", "-k",
+                        f"{TELNET_PORT}/tcp", f"{RTSP_PORT}/tcp",
+                        f"{HTTP_PORT}/tcp", f"{FTP_PORT}/tcp",
+                        f"{WEB_PORT}/tcp"], capture_output=True)
         sys.exit(0)
 
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
     # Start all modules
-    threading.Thread(target=telnet_honeypot, args=(2323,), daemon=True).start()
-    threading.Thread(target=rtsp_honeypot, args=(8554,), daemon=True).start()
-    threading.Thread(target=ftp_honeypot, args=(2121,), daemon=True).start()
+    threading.Thread(target=telnet_honeypot, args=(TELNET_PORT,), daemon=True).start()
+    threading.Thread(target=rtsp_honeypot, args=(RTSP_PORT,), daemon=True).start()
+    threading.Thread(target=ftp_honeypot, args=(FTP_PORT,), daemon=True).start()
     if HAS_RAW_NET:
         threading.Thread(target=traffic_monitor, daemon=True).start()
         threading.Thread(target=tshark_monitor, daemon=True).start()
@@ -7038,7 +7052,7 @@ def main():
 
     # Flask honeypot in background thread (so main thread can do console)
     flask_thread = threading.Thread(
-        target=lambda: app.run(host="0.0.0.0", port=8080, debug=False, use_reloader=False),
+        target=lambda: app.run(host="0.0.0.0", port=HTTP_PORT, debug=False, use_reloader=False),
         daemon=True
     )
     flask_thread.start()
