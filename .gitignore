@@ -51,3 +51,7 @@ tools/keygen_private.key
 pro_beta/
 netwatch
 pro_beta_snapshots/
+
+# VPS / deploy notes — environment-specific, do not publish
+docs/VPS_*
+docs/private/
