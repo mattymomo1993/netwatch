@@ -311,6 +311,14 @@ def log_event(service, ip, data):
     if mesh_alert_fwd and mesh_interface and service in ("credential", "malware_attempt", "ftp_upload"):
         threading.Thread(target=_mesh_forward_alert, args=(f"{service} from {ip}: {short}",), daemon=True).start()
 
+    # CrowdSec hand-off (no-op if cscli missing). Runs OUTSIDE both locks.
+    if os.environ.get("NETWATCH_AUTODEFEND", "1") == "1":
+        try:
+            from netwatch_crowdsec import maybe_defend as _cs_defend
+            threading.Thread(target=_cs_defend, args=(service, ip), daemon=True).start()
+        except ImportError:
+            pass
+
 def _short_summary(service, ip, data):
     if service == "credential":
         pw = data.get('password') or ''
@@ -5423,7 +5431,7 @@ background:rgba(0,212,255,.1);color:var(--cyan);border:1px solid rgba(0,212,255,
   <div class="close-hint">Esc to close</div>
 </div>
 <script>
-const TABS=["all","hosts","proto","dns","honeypot","nmap","arp","alerts","osint","proxy","mesh","replay","help"];
+const TABS=["all","hosts","proto","dns","honeypot","scan","nmap","arp","alerts","osint","proxy","mesh","replay","help"];
 let tab="all",D={};
 function $(s){return document.querySelector(s)}
 function $$(s){return document.querySelectorAll(s)}
@@ -5491,12 +5499,21 @@ function renderDNS(limit){
   return s+"</table>";
 }
 function renderHP(limit){
-  // HTTP events are filtered here (not at payload level) so the data is still in D.honeypot
-  // for future toggles. Mirrors the TUI's _section_honeypot(show_http=False) default.
+  // HTTP events live in the Scan tab (they're high-volume scanner noise that drowns out
+  // credential/telnet/ftp/rtsp signal). Mirrors the TUI's _section_honeypot(show_http=False) default.
   const h=(D.honeypot||[]).filter(e=>e.service!=="http").slice(-(limit||50)).reverse();
   if(!h.length)return _empty("No honeypot hits yet","Honeypots are listening on :21 / :23 / :80 / :554 — waiting for attackers.");
   let s=`<table><tr><th style="width:70px">Time</th><th style="width:100px">Service</th><th style="width:130px">IP</th><th>Summary</th></tr>`;
   h.forEach(e=>{s+=`<tr><td style="color:var(--dim)">${esc(e.time)}</td><td class="${hpClass(e.service)}">${esc(e.service)}</td><td class="ip"><span class="ip-click" data-ip="${esc(e.ip)}">${esc(e.ip)}</span></td><td>${esc(e.summary)}</td></tr>`});
+  return s+"</table>";
+}
+function renderScan(limit){
+  // HTTP probes split out from the honeypot tab — Mirai/CVE scanners hammer :80 constantly,
+  // so this view is its own signal class (path coverage, user agents, scanner identification).
+  const h=(D.honeypot||[]).filter(e=>e.service==="http").slice(-(limit||100)).reverse();
+  if(!h.length)return _empty("No HTTP probes yet","HTTP scan/probe traffic appears here once attackers hit :80.");
+  let s=`<table><tr><th style="width:70px">Time</th><th style="width:130px">IP</th><th>Probe</th></tr>`;
+  h.forEach(e=>{s+=`<tr><td style="color:var(--dim)">${esc(e.time)}</td><td class="ip"><span class="ip-click" data-ip="${esc(e.ip)}">${esc(e.ip)}</span></td><td>${esc(e.summary)}</td></tr>`});
   return s+"</table>";
 }
 function renderNmap(){
@@ -5835,6 +5852,9 @@ function render(){
   }else if(tab==="honeypot"){
     html+=`<div class="section-title">HONEYPOT EVENTS</div>`;
     html+=renderHP();
+  }else if(tab==="scan"){
+    html+=`<div class="section-title">SCAN PROBES <span class="count">(${(D.honeypot||[]).filter(e=>e.service==="http").length})</span></div>`;
+    html+=renderScan();
   }else if(tab==="nmap"){
     html+=renderNmap();
   }else if(tab==="arp"){
