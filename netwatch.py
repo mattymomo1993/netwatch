@@ -5479,8 +5479,10 @@ function renderDNS(limit){
   return s+"</table>";
 }
 function renderHP(limit){
-  const h=(D.honeypot||[]).slice(-(limit||50)).reverse();
-  if(!h.length)return _empty("No honeypot hits yet","Honeypots are listening on :8080 / :2323 / :2121 / :8554 — waiting for attackers.");
+  // HTTP events are filtered here (not at payload level) so the data is still in D.honeypot
+  // for future toggles. Mirrors the TUI's _section_honeypot(show_http=False) default.
+  const h=(D.honeypot||[]).filter(e=>e.service!=="http").slice(-(limit||50)).reverse();
+  if(!h.length)return _empty("No honeypot hits yet","Honeypots are listening on :21 / :23 / :80 / :554 — waiting for attackers.");
   let s=`<table><tr><th style="width:70px">Time</th><th style="width:100px">Service</th><th style="width:130px">IP</th><th>Summary</th></tr>`;
   h.forEach(e=>{s+=`<tr><td style="color:var(--dim)">${esc(e.time)}</td><td class="${hpClass(e.service)}">${esc(e.service)}</td><td class="ip"><span class="ip-click" data-ip="${esc(e.ip)}">${esc(e.ip)}</span></td><td>${esc(e.summary)}</td></tr>`});
   return s+"</table>";
@@ -5805,7 +5807,7 @@ function render(){
     html+=renderProto();
     html+=`<div class="section-title">DNS <span class="count">(${(D.dns||[]).length})</span></div>`;
     html+=renderDNS(5);
-    html+=`<div class="section-title">HONEYPOT <span class="count">(${(D.honeypot||[]).length})</span></div>`;
+    html+=`<div class="section-title">HONEYPOT <span class="count">(${(D.honeypot||[]).filter(e=>e.service!=="http").length})</span></div>`;
     html+=renderHP(5);
     if((D.alerts||[]).length){html+=`<div class="section-title" style="color:var(--red)">ALERTS <span class="count">(${D.alerts.length})</span></div>`;html+=renderAlerts()}
   }else{cr.style.display="none"}
