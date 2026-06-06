@@ -2686,6 +2686,80 @@ def _resolve_target(token):
     return token
 
 
+_replay_last_index = []
+
+
+def _disp_replay(parts):
+    global _replay_last_index
+    sub = parts[1].lower() if len(parts) >= 2 else "list"
+
+    if sub == "list" or len(parts) < 2:
+        try:
+            rows = replay.replay_index()
+        except Exception as e:
+            add_console(f"{RED}replay: index failed: {e}{RESET}")
+            return
+        if not rows:
+            add_console(f"{DIM}No captured sessions yet. Run the honeypots and wait for traffic.{RESET}")
+            _replay_last_index = []
+            return
+        top = rows[:20]
+        _replay_last_index = top
+        add_console(f"{BOLD}{CYAN}CAPTURED SESSIONS — top {len(top)} of {len(rows)}{RESET}")
+        add_console(f"  {DIM}#   session_id                        proto  ip               events   started_at{RESET}")
+        for i, r in enumerate(top, 1):
+            sid = (r.get("session_id") or "")[:34]
+            proto = (r.get("protocol") or "")[:6]
+            ip = (r.get("ip") or "")[:15]
+            evc = str(r.get("event_count", ""))[:7]
+            started = (r.get("started_at_mtime") or "")[:19]
+            add_console(f"  {i:<3} {sid:<34} {proto:<6} {ip:<15} {evc:<8} {started}")
+        add_console(f"{DIM}  → `replay <#>` or `replay <session_id> [ftp|telnet]` to load{RESET}")
+        return
+
+    raw = parts[1]
+    proto = parts[2].lower() if len(parts) >= 3 else None
+
+    sid = None
+    chosen_proto = proto or "ftp"
+    if raw.isdigit():
+        idx = int(raw) - 1
+        if not (0 <= idx < len(_replay_last_index)):
+            add_console(f"{RED}replay: index {raw} out of range — run `replay list` first{RESET}")
+            return
+        row = _replay_last_index[idx]
+        sid = row.get("session_id")
+        if not proto:
+            chosen_proto = row.get("protocol") or "ftp"
+    else:
+        sid = raw
+
+    try:
+        timeline = replay.replay_loader(sid, protocol=chosen_proto)
+        timeline["intel"] = replay.load_intel(timeline.get("ip", ""))
+    except FileNotFoundError as e:
+        add_console(f"{RED}replay: session not found: {e}{RESET}")
+        return
+    except ValueError as e:
+        add_console(f"{RED}replay: {e}{RESET}")
+        return
+    except Exception as e:
+        add_console(f"{RED}replay: load failed: {e}{RESET}")
+        return
+
+    app_state.replay_session_id = sid
+    app_state.replay_protocol = chosen_proto
+    app_state.replay_timeline = timeline
+    app_state.replay_cursor_ms = 0
+    app_state.replay_playing = False
+    app_state.replay_speed = 1.0
+    app_state.replay_last_tick = time.monotonic()
+    app_state.switch(SCREEN_REPLAY)
+    add_console(f"{GREEN}replay: loaded {sid} ({chosen_proto}) — {len(timeline.get('events', []))} events, "
+                f"{timeline.get('duration_ms', 0)/1000:.1f}s{RESET}")
+    _redraw_event.set()
+
+
 def handle_command(cmd):
     global current_tab, console_mode, proxy_rotation
     parts = cmd.strip().split()
@@ -2760,7 +2834,7 @@ def handle_command(cmd):
         "subnet": (1, _disp_subnet), "pcap": (1, _disp_pcap),
         "blockall": (1, _disp_blockall), "tag": (1, _disp_tag), "note": (1, _disp_note),
         "watch": (1, _disp_watch), "mesh": (1, _disp_mesh), "ifinfo": (1, _disp_ifinfo),
-        "proxy": (1, _disp_proxy),
+        "proxy": (1, _disp_proxy), "replay": (1, _disp_replay),
     }
 
     if action in _DIRECT_CMDS:
@@ -4686,6 +4760,215 @@ def _paint_console():
     _write_frame(buf)
 
 
+_REPLAY_SPEED_STEPS = (0.25, 0.5, 1.0, 2.0, 4.0, 8.0)
+
+
+def _replay_fmt_ms(ms):
+    if ms is None or ms < 0:
+        ms = 0
+    s, msr = divmod(int(ms), 1000)
+    m, s = divmod(s, 60)
+    return f"{m:02d}:{s:02d}.{msr:03d}"
+
+
+def _replay_event_color(kind):
+    k = (kind or "").lower()
+    if k in ("client", "cmd", "login"):
+        return CYAN
+    if k == "server":
+        return GREEN
+    if k in ("cred", "credential"):
+        return RED
+    if k == "malware":
+        return YELLOW
+    if k == "connect":
+        return BLUE
+    return ""
+
+
+def _replay_advance_cursor():
+    now = time.monotonic()
+    last = app_state.replay_last_tick or now
+    app_state.replay_last_tick = now
+    if not app_state.replay_playing:
+        return
+    tl = app_state.replay_timeline
+    if not tl:
+        return
+    dur = int(tl.get("duration_ms") or 0)
+    if dur <= 0:
+        app_state.replay_playing = False
+        return
+    delta = (now - last) * 1000.0 * float(app_state.replay_speed)
+    app_state.replay_cursor_ms = int(app_state.replay_cursor_ms + delta)
+    if app_state.replay_cursor_ms >= dur:
+        app_state.replay_cursor_ms = dur
+        app_state.replay_playing = False
+
+
+def _paint_replay():
+    _replay_advance_cursor()
+    cols, rows = _get_terminal_dims()
+    cols = max(60, cols)
+    rows = max(12, rows)
+
+    tl = app_state.replay_timeline
+    buf = "\033[?25l\033[H"
+
+    if not tl:
+        title = f"{BOLD}{RED}  NETWATCH — REPLAY{RESET}  {DIM}(no session loaded){RESET}"
+        buf += title + "\033[K\n"
+        buf += f"{DIM}{'─'*min(cols, 78)}{RESET}\033[K\n"
+        msg = [
+            "",
+            f"  {DIM}No replay session loaded.{RESET}",
+            "",
+            f"  Type {GREEN}replay list{RESET} to see captured sessions,",
+            f"  then {GREEN}replay <#>{RESET} or {GREEN}replay <session_id>{RESET} to load one.",
+            "",
+            f"  {DIM}[q] back to dashboard{RESET}",
+        ]
+        for line in msg:
+            buf += line + "\033[K\n"
+        for _ in range(rows - 2 - len(msg)):
+            buf += "\033[K\n"
+        _write_frame(buf)
+        return
+
+    sid = tl.get("session_id", "")
+    proto = tl.get("protocol", app_state.replay_protocol)
+    ip = tl.get("ip", "")
+    dur = int(tl.get("duration_ms") or 0)
+    cur = max(0, min(int(app_state.replay_cursor_ms), dur))
+    events = tl.get("events") or []
+    intel = tl.get("intel") or {}
+
+    side_w = 22 if cols >= 80 else 0
+    main_w = cols - side_w - (1 if side_w else 0)
+
+    end_tag = f"  {BOLD}{YELLOW}[END]{RESET}" if (not app_state.replay_playing and cur >= dur and dur > 0) else ""
+    title = f"{BOLD}{RED}  NETWATCH — REPLAY{RESET}  {DIM}{sid}{RESET}{end_tag}"
+    buf += title + "\033[K\n"
+    buf += f"{DIM}{'─'*min(cols, 78)}{RESET}\033[K\n"
+
+    meta = (f"  {DIM}proto:{RESET} {proto}   {DIM}ip:{RESET} {ip}   "
+            f"{DIM}duration:{RESET} {_replay_fmt_ms(dur)}   "
+            f"{DIM}events:{RESET} {len(events)}")
+    buf += meta + "\033[K\n"
+
+    body_rows = max(4, rows - 6)
+
+    cur_idx = -1
+    for i, e in enumerate(events):
+        if int(e.get("t_ms", 0)) <= cur:
+            cur_idx = i
+        else:
+            break
+
+    show = body_rows
+    if len(events) <= show:
+        start = 0
+    else:
+        anchor = max(0, cur_idx - (show * 2 // 3))
+        start = min(anchor, len(events) - show)
+        start = max(0, start)
+    end = min(len(events), start + show)
+    window = events[start:end]
+
+    side_lines = []
+    if side_w:
+        def _pad(label, val):
+            v = ("" if val is None else str(val))[:side_w - len(label) - 2]
+            return f"{DIM}{label}{RESET}{v}"
+        if intel:
+            side_lines.append(f"{BOLD}{WHITE}INTEL{RESET}")
+            side_lines.append(_pad("Country: ", intel.get("country") or "—"))
+            side_lines.append(_pad("ASN:     ", intel.get("asn") or "—"))
+            side_lines.append(_pad("Org:     ", intel.get("org") or "—"))
+            side_lines.append(_pad("Abuse:   ", intel.get("abuse_score") or "—"))
+            tags = intel.get("tags") or []
+            side_lines.append(_pad("Tags:    ", ", ".join(tags)[:side_w - 10] if tags else "—"))
+            host = intel.get("hostname") or ""
+            if host:
+                side_lines.append(_pad("Host:    ", host))
+            notes = intel.get("notes") or ""
+            if notes:
+                side_lines.append("")
+                side_lines.append(f"{DIM}Notes:{RESET}")
+                s = str(notes)
+                while s and len(side_lines) < body_rows:
+                    side_lines.append(s[:side_w])
+                    s = s[side_w:]
+        else:
+            side_lines.append(f"{BOLD}{WHITE}INTEL{RESET}")
+            side_lines.append(f"{DIM}(no recon data){RESET}")
+            side_lines.append("")
+            side_lines.append(f"{DIM}Run `recon {ip}`")
+            side_lines.append(f"{DIM}from dashboard.{RESET}")
+        side_lines = side_lines[:body_rows]
+        while len(side_lines) < body_rows:
+            side_lines.append("")
+
+    for row in range(body_rows):
+        if row < len(window):
+            e = window[row]
+            ev_idx = start + row
+            t_ms = int(e.get("t_ms", 0))
+            kind = (e.get("kind") or "").upper()[:8]
+            text = (e.get("text") or "").replace("\n", " ").replace("\r", "")
+            future = t_ms > cur
+            color = _replay_event_color(e.get("kind"))
+            ts = _replay_fmt_ms(t_ms)
+            line = f"[{ts}] {kind:<8} {text}"
+            max_text = main_w - 4
+            if len(line) > max_text:
+                line = line[:max_text - 1] + "…"
+            marker = " "
+            if ev_idx == cur_idx:
+                marker = f"{BOLD}{WHITE}▶{RESET}"
+            if future:
+                rendered = f" {marker} {DIM}{line}{RESET}"
+            elif ev_idx == cur_idx:
+                rendered = f" {marker} {BOLD}{color}{line}{RESET}"
+            else:
+                rendered = f" {marker} {color}{line}{RESET}"
+            left_cell = rendered
+        elif row == 0 and not window:
+            left_cell = f"  {DIM}(no events captured){RESET}"
+        else:
+            left_cell = ""
+
+        visible_len = len(re.sub(r"\033\[[0-9;]*m", "", left_cell))
+        pad = max(0, main_w - visible_len)
+        out_line = left_cell + (" " * pad)
+
+        if side_w:
+            side_cell = side_lines[row]
+            s_vis = len(re.sub(r"\033\[[0-9;]*m", "", side_cell))
+            s_pad = max(0, side_w - s_vis)
+            out_line += f"{DIM}│{RESET}" + side_cell + (" " * s_pad)
+
+        buf += out_line + "\033[K\n"
+
+    bar_w = max(10, cols - 30)
+    filled = int(bar_w * (cur / dur)) if dur > 0 else bar_w
+    filled = max(0, min(filled, bar_w))
+    bar = ("█" * filled) + ("─" * (bar_w - filled))
+    play_tag = f"{GREEN}▶{RESET}" if app_state.replay_playing else f"{YELLOW}❚❚{RESET}"
+    spd_s = f"{app_state.replay_speed:g}x"
+    footer1 = f" {play_tag} {bar} {_replay_fmt_ms(cur)}/{_replay_fmt_ms(dur)}  {DIM}speed:{RESET} {spd_s}"
+    footer2 = (f" {DIM}[SPACE] play  [←→] ±1s  [</>] ±10s  [+-] speed  "
+               f"[Home/End] jump  [q] back{RESET}")
+    buf += footer1 + "\033[K\n"
+    buf += footer2 + "\033[K\n"
+
+    rendered_rows = 4 + body_rows + 2
+    for _ in range(max(0, rows - rendered_rows)):
+        buf += "\033[K\n"
+
+    _write_frame(buf)
+
+
 def _render_frame():
     # console_mode (legacy) suppresses all paint — caller owns the terminal.
     if console_mode or _input_active:
@@ -4706,6 +4989,8 @@ def _render_frame():
             _paint_cli()
         elif screen == SCREEN_CONSOLE:
             _paint_console()
+        elif screen == SCREEN_REPLAY:
+            _paint_replay()
         else:
             _paint_dashboard()
     finally:
@@ -7134,8 +7419,11 @@ def main():
             seq = b""
             while select.select([fd], [], [], 0.05)[0]:
                 seq += os.read(fd, 1)
+            if seq == b"": return "esc"
             if seq == b"[A": return "up"
             if seq == b"[B": return "down"
+            if seq == b"[C": return "right"
+            if seq == b"[D": return "left"
             if seq == b"[5~": return "pgup"
             if seq == b"[6~": return "pgdn"
             if seq in (b"[H", b"[1~"): return "home"
@@ -7274,6 +7562,55 @@ def main():
                 app_state.switch(SCREEN_CLI); _redraw_event.set(); continue
             if key == "f3":
                 app_state.switch(SCREEN_CONSOLE); _redraw_event.set(); continue
+
+            # Replay screen owns its own bindings (space/arrows/</>/+-/home/end/q).
+            if app_state.current_screen == SCREEN_REPLAY:
+                tl = app_state.replay_timeline
+                dur = int((tl or {}).get("duration_ms") or 0)
+                if key == "q" or key == "esc":
+                    app_state.replay_playing = False
+                    app_state.switch(app_state.last_screen or SCREEN_DASHBOARD)
+                    _redraw_event.set(); continue
+                if key == " ":
+                    if dur > 0:
+                        if app_state.replay_cursor_ms >= dur:
+                            app_state.replay_cursor_ms = 0
+                        app_state.replay_playing = not app_state.replay_playing
+                        app_state.replay_last_tick = time.monotonic()
+                    _redraw_event.set(); continue
+                if key == "left":
+                    app_state.replay_cursor_ms = max(0, app_state.replay_cursor_ms - 1000)
+                    _redraw_event.set(); continue
+                if key == "right":
+                    app_state.replay_cursor_ms = min(dur, app_state.replay_cursor_ms + 1000)
+                    _redraw_event.set(); continue
+                if key == "<" or key == ",":
+                    app_state.replay_cursor_ms = max(0, app_state.replay_cursor_ms - 10000)
+                    _redraw_event.set(); continue
+                if key == ">" or key == ".":
+                    app_state.replay_cursor_ms = min(dur, app_state.replay_cursor_ms + 10000)
+                    _redraw_event.set(); continue
+                if key == "home":
+                    app_state.replay_cursor_ms = 0
+                    _redraw_event.set(); continue
+                if key == "end":
+                    app_state.replay_cursor_ms = dur
+                    app_state.replay_playing = False
+                    _redraw_event.set(); continue
+                if key in ("+", "="):
+                    try:
+                        i = _REPLAY_SPEED_STEPS.index(app_state.replay_speed)
+                    except ValueError:
+                        i = 2
+                    app_state.replay_speed = _REPLAY_SPEED_STEPS[min(i + 1, len(_REPLAY_SPEED_STEPS) - 1)]
+                    _redraw_event.set(); continue
+                if key in ("-", "_"):
+                    try:
+                        i = _REPLAY_SPEED_STEPS.index(app_state.replay_speed)
+                    except ValueError:
+                        i = 2
+                    app_state.replay_speed = _REPLAY_SPEED_STEPS[max(i - 1, 0)]
+                    _redraw_event.set(); continue
 
             # Scroll keys target the active screen's buffer.
             _scr = app_state.current_screen

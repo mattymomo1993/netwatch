@@ -161,6 +161,18 @@ whitelist:
   ip: ["<your-public-ip>"]
 ```
 
+## Session Replay
+
+```bash
+sudo netwatch                                          # capture starts immediately
+python tools/synth_ftp_session.py 198.51.100.42        # optional — fake an attacker
+# open http://localhost:9090 and click the REPLAY tab
+```
+
+Every captured session (FTP, Telnet, HTTP probes) is recorded as a scrubbable timeline. The web player auto-lists sessions; pick one and step through the keystrokes frame by frame. In the TUI, `replay list` shows recent sessions and `replay <idx>` drops into the player.
+
+Player keys: `space` play/pause · `←/→` step · `</>` jump session · `+/-` speed · `Home/End` ends. Full architecture in [`docs/DROP4_TUI_REPLAY_PLAN.md`](docs/DROP4_TUI_REPLAY_PLAN.md).
+
 ## Remote Access
 
 When `cloudflared` is available, NetWatch starts a quick tunnel automatically at launch. The public `*.trycloudflare.com` URL is printed at startup and pinned to the top of the **all** tab on the dashboard so you can copy it without scrolling through alerts.
