@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
-      id-token: write   # required for Trusted Publishing — no secrets needed
+      id-token:7d631207-d21b-48d6-8ceb-9897d45096ac
 
     steps:
       - uses: actions/checkout@v4
