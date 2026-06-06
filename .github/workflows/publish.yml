@@ -4,6 +4,17 @@ on:
   push:
     tags:
       - "v*"
+  sub`: `repo:Mattmorris-dev/netwatch-sec:environment:pypi
+    repository`: Mattmorris-dev/netwatch-sec
+    repository_owner : Mattmorris-dev
+    repository_owner_id : 125585503
+    workflow_ref`: Mattmorris-dev/netwatch-sec/.github/workflows/publish.yml@refs/tags/v1.2.0
+    job_workflow_ref`: Mattmorris-dev/netwatch-sec/.github/workflows/publish.yml@refs/tags/v1.2.0
+    ref`: refs/tags/v1.2.0
+environment`: pypi
+
+
+      
 
 jobs:
   build-and-publish:
