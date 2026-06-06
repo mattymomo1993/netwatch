@@ -431,6 +431,82 @@ class TestTelnetGapEnvVar:
         monkeypatch.setenv("NETWATCH_TELNET_GAP_SEC", "-50")
         assert replay._telnet_gap_sec() == 1
 
+    def test_absurd_value_clamped_to_max(self, monkeypatch):
+        # 30 days = 2,592,000 seconds. Anything higher gets clamped.
+        monkeypatch.setenv("NETWATCH_TELNET_GAP_SEC", "9999999999")
+        assert replay._telnet_gap_sec() == replay._TELNET_GAP_MAX
+
+
+class TestSessionIdHardening:
+    """ipaddress-backed validation closes gaps the loose regex would let through."""
+
+    def test_valid_ipv4_passes(self):
+        replay._validate_session_id("1.2.3.4_120000")
+        replay._validate_session_id("all_1.2.3.4")
+
+    def test_valid_ipv6_passes(self):
+        replay._validate_session_id("all_2001:db8::1")
+
+    def test_path_traversal_blocked_by_regex(self):
+        with pytest.raises(ValueError):
+            replay._validate_session_id("all_../../etc/passwd")
+
+    def test_malformed_ipv6_blocked_by_ipaddress(self):
+        # Survives the loose regex ([0-9a-fA-F.:]+ allows this) but ipaddress rejects.
+        with pytest.raises(ValueError):
+            replay._validate_session_id("all_::::::")
+
+    def test_empty_ip_after_prefix_blocked(self):
+        with pytest.raises(ValueError):
+            replay._validate_session_id("all_")
+
+    def test_shell_metachar_blocked(self):
+        with pytest.raises(ValueError):
+            replay._validate_session_id("all_1.2.3.4;rm")
+
+    def test_none_blocked(self):
+        with pytest.raises(ValueError):
+            replay._validate_session_id(None)
+
+    def test_empty_blocked(self):
+        with pytest.raises(ValueError):
+            replay._validate_session_id("")
+
+
+class TestTelnetByIpCache:
+    """_group_telnet_by_ip is cached to stop /api/replay/all_<random> DoS."""
+
+    def setup_method(self):
+        replay._telnet_byip_cache.update({
+            "at": 0.0, "data": None, "dir": None, "dir_mtime": 0.0, "gap": 0,
+        })
+
+    def test_repeat_call_hits_cache(self, tmp_path):
+        events = [
+            _telnet_event("2026-06-02T02:47:10+00:00", "1.2.3.4", username="root"),
+        ]
+        _write_all_events(tmp_path, events)
+        first = replay._group_telnet_by_ip(str(tmp_path))
+        second = replay._group_telnet_by_ip(str(tmp_path))
+        # Same object identity on the cache hit — proves no re-parse.
+        assert first is second
+
+    def test_gap_change_invalidates_cache(self, tmp_path, monkeypatch):
+        events = [
+            _telnet_event("2026-06-02T02:00:00+00:00", "5.5.5.5", username="root"),
+            _telnet_event("2026-06-02T02:10:00+00:00", "5.5.5.5", username="admin"),
+        ]
+        _write_all_events(tmp_path, events)
+        monkeypatch.delenv("NETWATCH_TELNET_GAP_SEC", raising=False)
+        a = replay._group_telnet_by_ip(str(tmp_path))
+        assert a["5.5.5.5"]["attempts"] == 2
+
+        monkeypatch.setenv("NETWATCH_TELNET_GAP_SEC", "86400")
+        b = replay._group_telnet_by_ip(str(tmp_path))
+        assert b["5.5.5.5"]["attempts"] == 1
+        # Different objects — cache was invalidated by gap change.
+        assert a is not b
+
 
 class TestTelnetReplayLoader:
     def test_loads_login_events_as_timeline(self, tmp_path):

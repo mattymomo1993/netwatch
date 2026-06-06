@@ -12,6 +12,7 @@ Public API:
 Read-only. No edits to underlying logs. Stdlib only, no new deps.
 """
 
+import ipaddress
 import json
 import os
 import re
@@ -38,7 +39,8 @@ _SESSION_TIME_SUFFIX_RE = re.compile(r"_[0-9]{6}(?:_[0-9]+)?\Z")
 _LEGACY_LINE_RE = re.compile(r"^\[(\d{2}:\d{2}:\d{2}\.\d{3})\]\s+(\w+):\s*(.*)$")
 
 _INDEX_CACHE_TTL = 5.0
-_index_cache = {"at": 0.0, "data": None, "dir": None, "dir_mtime": 0.0}
+_index_cache = {"at": 0.0, "data": None, "dir": None, "dir_mtime": 0.0, "gap": 0}
+_telnet_byip_cache = {"at": 0.0, "data": None, "dir": None, "dir_mtime": 0.0, "gap": 0}
 _cache_lock = threading.Lock()
 
 
@@ -54,8 +56,23 @@ def _resolve_log_dir(log_dir):
 
 
 def _validate_session_id(session_id):
+    """Two-stage guard: regex shape + IP structural validation.
+
+    Regex blocks shell/path metacharacters; ipaddress.ip_address rejects malformed
+    addresses (e.g. "all_::::::", "all_..", excessive colon runs) that survived
+    the loose character-class regex.
+    """
     if not SESSION_ID_RE.match(session_id or ""):
         raise ValueError(f"invalid session_id: {session_id!r}")
+    # Extract IP portion for structural check.
+    if session_id.startswith(_TELNET_AGG_PREFIX):
+        ip_part = session_id[len(_TELNET_AGG_PREFIX):]
+    else:
+        ip_part = _SESSION_TIME_SUFFIX_RE.sub("", session_id)
+    try:
+        ipaddress.ip_address(ip_part)
+    except ValueError:
+        raise ValueError(f"invalid session_id (bad ip): {session_id!r}")
 
 
 def _session_log_path(session_id, log_dir):
@@ -161,10 +178,15 @@ def _load_ftp_session(session_id, log_dir):
 TELNET_SESSION_GAP_SEC = 300  # historical default; the live value is _telnet_gap_sec().
 
 
+# Clamp upper bound to 30 days — prevents an operator-set absurd gap from
+# collapsing all attacker activity into one giant timeline that OOMs the renderer.
+_TELNET_GAP_MAX = 86400 * 30
+
+
 def _telnet_gap_sec():
     try:
         v = int(os.environ.get("NETWATCH_TELNET_GAP_SEC", str(TELNET_SESSION_GAP_SEC)))
-        return max(1, v)
+        return max(1, min(v, _TELNET_GAP_MAX))
     except ValueError:
         return TELNET_SESSION_GAP_SEC
 _TELNET_SERVICES = {"telnet", "telnet_cmd", "malware_attempt"}
@@ -254,7 +276,22 @@ def _group_telnet_by_ip(log_dir):
     Visible "── ATTEMPT N (yyyy-mm-dd HH:MM:SS UTC) ──" connect markers separate
     bursts (same gap rule as _group_telnet_sessions). Returns:
         dict: ip -> {"ip", "first_ms", "raw": [(ms, kind, text)], "attempts": int}
+
+    Cached on (log_dir, mtime, gap_sec) so unauthenticated /api/replay/all_<ip>
+    requests can't force repeated full all_events.json parses (DoS).
     """
+    now = _time.monotonic()
+    dmtime = _dir_mtime(log_dir)
+    gap_sec = _telnet_gap_sec()
+    with _cache_lock:
+        c = _telnet_byip_cache
+        if (c["dir"] == log_dir
+                and c["data"] is not None
+                and c["dir_mtime"] == dmtime
+                and c["gap"] == gap_sec
+                and now - c["at"] < _INDEX_CACHE_TTL):
+            return c["data"]
+
     by_ip = {}
     for ts, ip, service, data in _iter_telnet_events(log_dir):
         try:
@@ -265,7 +302,7 @@ def _group_telnet_by_ip(log_dir):
         kind, text = _format_telnet_event(service, data)
         by_ip.setdefault(ip, []).append((ms, kind, text))
 
-    gap_ms = _telnet_gap_sec() * 1000
+    gap_ms = gap_sec * 1000
     out = {}
     for ip, events in by_ip.items():
         events.sort(key=lambda x: x[0])
@@ -287,6 +324,11 @@ def _group_telnet_by_ip(log_dir):
                 "raw": merged,
                 "attempts": attempt_num,
             }
+    with _cache_lock:
+        _telnet_byip_cache.update({
+            "at": now, "data": out, "dir": log_dir,
+            "dir_mtime": dmtime, "gap": gap_sec,
+        })
     return out
 
 
@@ -349,11 +391,15 @@ def replay_index(log_dir=None):
     log_dir = _resolve_log_dir(log_dir)
     now = _time.monotonic()
     dmtime = _dir_mtime(log_dir)
+    gap_sec = _telnet_gap_sec()
     with _cache_lock:
+        # Cache key includes gap_sec — runtime env-var changes invalidate
+        # immediately instead of waiting for the 5s TTL or a dir mtime bump.
         if (_index_cache["dir"] == log_dir
                 and _index_cache["data"] is not None
                 and now - _index_cache["at"] < _INDEX_CACHE_TTL
-                and _index_cache["dir_mtime"] == dmtime):
+                and _index_cache["dir_mtime"] == dmtime
+                and _index_cache.get("gap") == gap_sec):
             # Shallow copy so callers can sort/mutate without corrupting the cache.
             return list(_index_cache["data"])
 
@@ -399,7 +445,10 @@ def replay_index(log_dir=None):
 
     out.sort(key=lambda r: r["started_at_mtime"], reverse=True)
     with _cache_lock:
-        _index_cache.update({"at": now, "data": out, "dir": log_dir, "dir_mtime": dmtime})
+        _index_cache.update({
+            "at": now, "data": out, "dir": log_dir,
+            "dir_mtime": dmtime, "gap": gap_sec,
+        })
     return list(out)
 
 

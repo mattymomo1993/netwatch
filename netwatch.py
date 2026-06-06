@@ -30,7 +30,7 @@ import threading
 import subprocess
 from datetime import datetime, timezone
 from collections import defaultdict, deque
-from flask import Flask, request, render_template_string, redirect, jsonify
+from flask import Flask, Response, request, render_template_string, redirect, jsonify
 from markupsafe import escape as _escape
 
 try:
@@ -483,6 +483,38 @@ def logout():
         del _session_store[ip]
     return redirect("/login")
 
+@app.route("/cam<int:cam_n>.mp4")
+@app.route("/cam<int:cam_n>.h264")
+@app.route("/video.mp4")
+@app.route("/stream.mp4")
+@app.route("/Streaming/Channels/<int:cam_n>")
+@app.route("/cgi-bin/snapshot.cgi")
+def fake_cam_feed(cam_n=1):
+    """Tarpit: trickles looped video at a rate-limited speed. Scanners
+    pulling these endpoints burn bandwidth + hold a socket. Logs total bytes
+    consumed when the connection finally closes."""
+    ip = request.remote_addr
+    if not _tarpit_should_trickle(ip):
+        return "404 Not Found", 404
+    log_event("http_tarpit_start", ip, {
+        "cam": cam_n, "path": request.path,
+        "ua": request.headers.get("User-Agent", "")[:200],
+    })
+
+    def gen():
+        bytes_sent = 0
+        try:
+            for buf, _ in _tarpit_chunks():
+                yield buf
+                bytes_sent += len(buf)
+        finally:
+            log_event("http_tarpit_end", ip, {
+                "cam": cam_n, "bytes_sent": bytes_sent,
+            })
+
+    return Response(gen(), mimetype="video/mp4")
+
+
 @app.route("/<path:path>", methods=["GET", "POST", "PUT", "DELETE"])
 def catch_all(path):
     log_event("scan_probe", request.remote_addr, {
@@ -585,6 +617,82 @@ def handle_telnet(client, addr):
             _service_conns["telnet"] = max(0, _service_conns["telnet"] - 1)
         client.close()
 
+# -- HONEYPOT TARPIT — looped video over RTSP + HTTP fake-cam routes
+#
+# After credential capture, instead of dropping the attacker we trickle bytes
+# from a looped MP4 (cat_loop.mp4 by default) at a rate-limited speed. Burns
+# their bandwidth, holds their socket, proves intent in the log (a port-scan
+# bot won't sit and pull video bytes; a real intruder will).
+#
+# Configurable via env so operators can disable, swap the file, or change the
+# trickle rate without code edits. File missing → tarpit returns 0 bytes,
+# normal honeypot flow continues.
+
+TARPIT_VIDEO_PATH = os.environ.get(
+    "NETWATCH_TARPIT_VIDEO",
+    os.path.join(BASE_DIR, "cat_loop.mp4"),
+)
+# Bytes-per-second target. Default 10 KB/s — slow enough that scanners give
+# up or pile their socket pool, fast enough that we don't trip ssh keepalive.
+TARPIT_BYTES_PER_SEC = max(
+    1024, int(os.environ.get("NETWATCH_TARPIT_RATE", "10240"))
+)
+# Hard upper bound so we don't leak threads if attacker leaves connection open.
+TARPIT_MAX_SEC = max(
+    1, int(os.environ.get("NETWATCH_TARPIT_MAX_SEC", "3600"))
+)
+# Set to "0" to disable both RTSP + HTTP tarpit and fall back to original behavior.
+TARPIT_ENABLED = os.environ.get("NETWATCH_TARPIT", "1") != "0"
+
+
+def _tarpit_should_trickle(ip):
+    """Skip tarpit for our own/whitelisted IPs so the operator's NVR scanner
+    or uptime checker doesn't get caught in it."""
+    if not TARPIT_ENABLED:
+        return False
+    if not os.path.exists(TARPIT_VIDEO_PATH):
+        return False
+    try:
+        if os.path.getsize(TARPIT_VIDEO_PATH) < 1024:
+            return False
+    except OSError:
+        return False
+    if ip in WHITELIST_SCAN:
+        return False
+    for pref in WHITELIST_PREFIXES:
+        if ip.startswith(pref):
+            return False
+    return True
+
+
+def _tarpit_chunks():
+    """Generator over the video file at a rate-limited speed. Loops on EOF.
+    Stops when TARPIT_MAX_SEC elapses or the consumer closes the connection.
+
+    Yields (chunk, elapsed_s) tuples so callers can track bytes_sent / decide
+    when to bail without re-reading wall-clock themselves.
+    """
+    rate = TARPIT_BYTES_PER_SEC
+    chunk_size = max(256, rate // 10)
+    delay = chunk_size / rate
+    start = time.monotonic()
+    deadline = start + TARPIT_MAX_SEC
+    try:
+        with open(TARPIT_VIDEO_PATH, "rb") as f:
+            while True:
+                now = time.monotonic()
+                if now >= deadline:
+                    return
+                buf = f.read(chunk_size)
+                if not buf:
+                    f.seek(0)
+                    continue
+                yield buf, now - start
+                time.sleep(delay)
+    except (FileNotFoundError, PermissionError, OSError):
+        return
+
+
 # -- HONEYPOT - RTSP
 
 def rtsp_honeypot(port=None):
@@ -602,6 +710,34 @@ def handle_rtsp(client, addr):
         data2 = client.recv(4096).decode(errors="replace")
         if data2:
             log_event("rtsp_auth", addr[0], {"port": addr[1], "auth_request": data2[:500]})
+            # Tarpit: pretend the auth worked, ship SDP, then trickle MP4 bytes
+            # so the scanner burns bandwidth and we log every byte they consume.
+            if _tarpit_should_trickle(addr[0]):
+                sdp = (
+                    "v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\ns=NVR-Stream\r\n"
+                    "c=IN IP4 0.0.0.0\r\nt=0 0\r\n"
+                    "m=video 0 RTP/AVP 26\r\na=rtpmap:26 JPEG/90000\r\n"
+                )
+                hdr = (
+                    f"RTSP/1.0 200 OK\r\nCSeq: 2\r\n"
+                    f"Content-Type: application/sdp\r\n"
+                    f"Content-Length: {len(sdp)}\r\n\r\n{sdp}"
+                )
+                try:
+                    client.sendall(hdr.encode())
+                except OSError:
+                    return
+                client.settimeout(TARPIT_MAX_SEC)
+                bytes_sent = 0
+                for buf, _ in _tarpit_chunks():
+                    try:
+                        client.sendall(buf)
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        break
+                    bytes_sent += len(buf)
+                log_event("rtsp_tarpit", addr[0], {
+                    "port": addr[1], "bytes_sent": bytes_sent,
+                })
     except Exception:
         pass
     finally:
@@ -2687,6 +2823,7 @@ def _resolve_target(token):
 
 
 _replay_last_index = []
+_replay_index_lock = threading.Lock()  # protects _replay_last_index — concurrent TUI + web access
 
 
 def _disp_replay(parts):
@@ -2701,18 +2838,21 @@ def _disp_replay(parts):
             return
         if not rows:
             add_console(f"{DIM}No captured sessions yet. Run the honeypots and wait for traffic.{RESET}")
-            _replay_last_index = []
+            with _replay_index_lock:
+                _replay_last_index = []
             return
         top = rows[:20]
-        _replay_last_index = top
+        with _replay_index_lock:
+            _replay_last_index = top
         add_console(f"{BOLD}{CYAN}CAPTURED SESSIONS — top {len(top)} of {len(rows)}{RESET}")
         add_console(f"  {DIM}#   session_id                        proto  ip               events   started_at{RESET}")
         for i, r in enumerate(top, 1):
-            sid = (r.get("session_id") or "")[:34]
-            proto = (r.get("protocol") or "")[:6]
-            ip = (r.get("ip") or "")[:15]
-            evc = str(r.get("event_count", ""))[:7]
-            started = (r.get("started_at_mtime") or "")[:19]
+            # Defense vs ANSI injection — IP/sid derived from attacker packets.
+            sid = _safe_text(r.get("session_id") or "")[:34]
+            proto = _safe_text(r.get("protocol") or "")[:6]
+            ip = _safe_text(r.get("ip") or "")[:15]
+            evc = _safe_text(str(r.get("event_count", "")))[:7]
+            started = _safe_text(r.get("started_at_mtime") or "")[:19]
             add_console(f"  {i:<3} {sid:<34} {proto:<6} {ip:<15} {evc:<8} {started}")
         add_console(f"{DIM}  → `replay <#>` or `replay <session_id> [ftp|telnet]` to load{RESET}")
         return
@@ -2724,10 +2864,13 @@ def _disp_replay(parts):
     chosen_proto = proto or "ftp"
     if raw.isdigit():
         idx = int(raw) - 1
-        if not (0 <= idx < len(_replay_last_index)):
+        # Snapshot under lock so a concurrent `replay list` can't tear the read.
+        with _replay_index_lock:
+            snapshot = list(_replay_last_index)
+        if not (0 <= idx < len(snapshot)):
             add_console(f"{RED}replay: index {raw} out of range — run `replay list` first{RESET}")
             return
-        row = _replay_last_index[idx]
+        row = snapshot[idx]
         sid = row.get("session_id")
         if not proto:
             chosen_proto = row.get("protocol") or "ftp"
@@ -4762,6 +4905,26 @@ def _paint_console():
 
 _REPLAY_SPEED_STEPS = (0.25, 0.5, 1.0, 2.0, 4.0, 8.0)
 
+# Strip every C0 control char (except plain SP/TAB), DEL, and any ANSI/OSC
+# escape so attacker-supplied recon/event text can't hijack the operator's
+# terminal (clear screen, OSC-52 clipboard write, fake prompt, etc.).
+_ANSI_STRIP_RE = re.compile(
+    r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?"  # OSC ... BEL or ST
+    r"|\x1b\[[0-?]*[ -/]*[@-~]"            # CSI
+    r"|\x1b[@-Z\\-_]"                      # 7-bit single ESC sequences
+    r"|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]"   # C0 (minus \t \n \r) + DEL
+)
+
+
+def _safe_text(s, allow_newlines=False):
+    """Return s with ANSI/control sequences removed. Defense vs terminal hijack."""
+    if s is None:
+        return ""
+    t = _ANSI_STRIP_RE.sub("", str(s))
+    if not allow_newlines:
+        t = t.replace("\n", " ").replace("\r", "")
+    return t
+
 
 def _replay_fmt_ms(ms):
     if ms is None or ms < 0:
@@ -4835,9 +4998,12 @@ def _paint_replay():
         _write_frame(buf)
         return
 
-    sid = tl.get("session_id", "")
-    proto = tl.get("protocol", app_state.replay_protocol)
-    ip = tl.get("ip", "")
+    # All session/timeline strings are attacker-influenceable (session_id derived
+    # from connect IP; ip via PTR; event text from raw bytes). Sanitize every
+    # value that touches the terminal — strips ANSI/OSC/control sequences.
+    sid = _safe_text(tl.get("session_id", ""))
+    proto = _safe_text(tl.get("protocol", app_state.replay_protocol))
+    ip = _safe_text(tl.get("ip", ""))
     dur = int(tl.get("duration_ms") or 0)
     cur = max(0, min(int(app_state.replay_cursor_ms), dur))
     events = tl.get("events") or []
@@ -4878,7 +5044,8 @@ def _paint_replay():
     side_lines = []
     if side_w:
         def _pad(label, val):
-            v = ("" if val is None else str(val))[:side_w - len(label) - 2]
+            # Strip ANSI/control from every intel value before truncation.
+            v = _safe_text("" if val is None else val)[:side_w - len(label) - 2]
             return f"{DIM}{label}{RESET}{v}"
         if intel:
             side_lines.append(f"{BOLD}{WHITE}INTEL{RESET}")
@@ -4887,7 +5054,8 @@ def _paint_replay():
             side_lines.append(_pad("Org:     ", intel.get("org") or "—"))
             side_lines.append(_pad("Abuse:   ", intel.get("abuse_score") or "—"))
             tags = intel.get("tags") or []
-            side_lines.append(_pad("Tags:    ", ", ".join(tags)[:side_w - 10] if tags else "—"))
+            safe_tags = ", ".join(_safe_text(t) for t in tags)
+            side_lines.append(_pad("Tags:    ", safe_tags[:side_w - 10] if safe_tags else "—"))
             host = intel.get("hostname") or ""
             if host:
                 side_lines.append(_pad("Host:    ", host))
@@ -4895,7 +5063,7 @@ def _paint_replay():
             if notes:
                 side_lines.append("")
                 side_lines.append(f"{DIM}Notes:{RESET}")
-                s = str(notes)
+                s = _safe_text(notes)
                 while s and len(side_lines) < body_rows:
                     side_lines.append(s[:side_w])
                     s = s[side_w:]
@@ -4914,8 +5082,10 @@ def _paint_replay():
             e = window[row]
             ev_idx = start + row
             t_ms = int(e.get("t_ms", 0))
-            kind = (e.get("kind") or "").upper()[:8]
-            text = (e.get("text") or "").replace("\n", " ").replace("\r", "")
+            kind = _safe_text((e.get("kind") or "").upper())[:8]
+            # Event text is attacker bytes (telnet username, FTP command, etc.).
+            # _safe_text strips C0/CSI/OSC before display.
+            text = _safe_text(e.get("text") or "")
             future = t_ms > cur
             color = _replay_event_color(e.get("kind"))
             ts = _replay_fmt_ms(t_ms)

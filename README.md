@@ -13,7 +13,7 @@
 [![Parrot OS](https://img.shields.io/badge/Parrot%20OS-15CDCA?logo=parrotsecurity&logoColor=white)](https://www.parrotsec.org/)
 [![Kali](https://img.shields.io/badge/Kali-557C94?logo=kalilinux&logoColor=white)](https://www.kali.org/)
 [![Platform: Debian](https://img.shields.io/badge/platform-debian-A81D33?logo=debian&logoColor=white)](https://www.debian.org/)
-[![Tests](https://img.shields.io/badge/tests-2046-brightgreen.svg)](tests/)
+[![Tests](https://img.shields.io/badge/tests-2094-brightgreen.svg)](tests/)
 [![Version](https://img.shields.io/badge/version-1.2.0-blue.svg)](CHANGELOG.md)
 [![Status: Active](https://img.shields.io/badge/status-active-brightgreen.svg)]()
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-FFDD00?logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/pr0xy_22)
@@ -140,6 +140,16 @@ sudo -E netwatch
 ```
 
 Persist by adding to `/etc/netwatch.env` and referencing in the systemd unit's `EnvironmentFile=`. Internet-facing scanners hit the standard ports — non-standard ports stay invisible to most drive-by traffic.
+
+### Replay tunables
+
+Same-IP telnet attempts roll up into one aggregated session (`all_<ip>`) so a scanner banging your honeypot all day shows as one entry instead of fifty. Inside the timeline, `── ATTEMPT N (timestamp UTC) ──` markers separate bursts. Tune the burst threshold with:
+
+```bash
+NETWATCH_TELNET_GAP_SEC=86400 sudo -E netwatch   # one marker per day (default: 300 = 5 min)
+```
+
+Individual per-attempt sessions remain loadable via their original `<ip>_HHMMSS` id for drill-down.
 
 ### CrowdSec auto-ban (optional)
 

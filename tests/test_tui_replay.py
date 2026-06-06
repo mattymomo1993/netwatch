@@ -259,3 +259,108 @@ class TestReplaySpeedSteps:
         assert steps == sorted(steps)
         assert 1.0 in steps
         assert steps[0] < 1.0 < steps[-1]
+
+
+class TestSafeText:
+    """ANSI/control-char stripper — defense vs operator terminal hijack.
+
+    All attacker-controlled strings (intel sidebar fields, event text, IPs,
+    session_ids) flow through _safe_text before reaching the terminal.
+    """
+
+    def test_passes_plain_text(self):
+        assert netwatch._safe_text("hello world") == "hello world"
+
+    def test_strips_csi_color(self):
+        assert netwatch._safe_text("\x1b[31mRED\x1b[0m") == "RED"
+
+    def test_strips_csi_cursor_move(self):
+        assert netwatch._safe_text("a\x1b[2Jb\x1b[Hc") == "abc"
+
+    def test_strips_osc_52_clipboard_hijack(self):
+        # OSC 52 = write to clipboard. Critical attack — recon JSON could exfil.
+        payload = "before\x1b]52;c;cGF5bG9hZA==\x07after"
+        assert netwatch._safe_text(payload) == "beforeafter"
+
+    def test_strips_osc_terminated_by_st(self):
+        payload = "x\x1b]0;FAKE TITLE\x1b\\y"
+        assert netwatch._safe_text(payload) == "xy"
+
+    def test_strips_c0_controls(self):
+        # \x07 BEL, \x08 BS, \x1f US, \x7f DEL
+        assert netwatch._safe_text("a\x07b\x08c\x1fd\x7fe") == "abcde"
+
+    def test_preserves_tab(self):
+        assert netwatch._safe_text("a\tb") == "a\tb"
+
+    def test_newlines_collapsed_to_space_by_default(self):
+        assert netwatch._safe_text("a\nb\rc") == "a bc"
+
+    def test_newlines_kept_when_allowed(self):
+        assert netwatch._safe_text("a\nb", allow_newlines=True) == "a\nb"
+
+    def test_none_returns_empty(self):
+        assert netwatch._safe_text(None) == ""
+
+    def test_int_safely_stringified(self):
+        assert netwatch._safe_text(42) == "42"
+
+    def test_no_lone_esc_left_behind(self):
+        # Solo ESC followed by non-ANSI gets stripped — closes a gap where
+        # an attacker could break out of a partial sequence.
+        assert "\x1b" not in netwatch._safe_text("a\x1bMb")
+
+    def test_paint_replay_sanitizes_intel(self):
+        # Full integration: an attacker-poisoned intel JSON cannot inject ANSI
+        # through the sidebar render.
+        from unittest.mock import patch
+        from netwatch import AppState
+        netwatch.app_state = AppState()
+        netwatch.app_state.replay_timeline = {
+            "session_id": "all_1.2.3.4",
+            "protocol": "telnet",
+            "ip": "1.2.3.4",
+            "duration_ms": 1000,
+            "events": [{"t_ms": 0, "kind": "connect", "text": "ok"}],
+            "intel": {
+                "country": "RU\x1b[2J",
+                "org": "\x1b]52;c;cGF5\x07evilcorp",
+                "hostname": "host\x1b[31m.bad",
+                "notes": "line1\x1b[Hline2",
+                "tags": ["clean", "ev\x1b[mil"],
+            },
+        }
+        with patch("netwatch._write_frame") as wf, \
+             patch("netwatch._get_terminal_dims", return_value=(120, 30)):
+            netwatch._paint_replay()
+        out = wf.call_args[0][0]
+        # No raw ESC byte from the attacker fields should reach the frame.
+        # The renderer's own ANSI for color is fine — we only check that no
+        # injected ANSI snuck through (cursor move \x1b[2J, OSC 52, etc.).
+        assert "\x1b[2J" not in out
+        assert "\x1b]52" not in out
+        assert "\x1b]52;c;cGF5\x07" not in out
+        # Sanitized contents still present (text minus the escapes).
+        assert "evilcorp" in out
+        assert "RU" in out
+
+    def test_paint_replay_sanitizes_event_text(self):
+        from unittest.mock import patch
+        from netwatch import AppState
+        netwatch.app_state = AppState()
+        netwatch.app_state.replay_timeline = {
+            "session_id": "all_1.2.3.4",
+            "protocol": "telnet",
+            "ip": "1.2.3.4",
+            "duration_ms": 1000,
+            "events": [
+                {"t_ms": 0, "kind": "client", "text": "USER \x1b]52;c;cGF5\x07root"},
+            ],
+            "intel": {},
+        }
+        with patch("netwatch._write_frame") as wf, \
+             patch("netwatch._get_terminal_dims", return_value=(120, 30)):
+            netwatch._paint_replay()
+        out = wf.call_args[0][0]
+        assert "\x1b]52" not in out
+        assert "USER root" in out
