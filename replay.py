@@ -209,8 +209,9 @@ def _group_telnet_sessions(log_dir):
     """Group telnet.* events into synthetic sessions keyed by (ip, first_ts).
 
     Returns dict: session_id -> {"ip", "first_ms", "raw": [(ms, kind, text)]}.
-    A session ends when there's a gap > TELNET_SESSION_GAP_SEC from the same IP.
+    A session ends when there's a gap > NETWATCH_TELNET_GAP_SEC from the same IP.
     """
+    gap_ms = _telnet_gap_sec() * 1000
     by_ip = {}
     for ts, ip, service, data in _iter_telnet_events(log_dir):
         try:
@@ -228,7 +229,7 @@ def _group_telnet_sessions(log_dir):
         cur_last = None
         bucket = []
         for ms, kind, text in events:
-            if cur_first is None or (ms - cur_last) > TELNET_SESSION_GAP_SEC * 1000:
+            if cur_first is None or (ms - cur_last) > gap_ms:
                 # close previous bucket
                 if bucket:
                     _flush_telnet_bucket(sessions, ip, cur_first, bucket)
@@ -264,6 +265,7 @@ def _group_telnet_by_ip(log_dir):
         kind, text = _format_telnet_event(service, data)
         by_ip.setdefault(ip, []).append((ms, kind, text))
 
+    gap_ms = _telnet_gap_sec() * 1000
     out = {}
     for ip, events in by_ip.items():
         events.sort(key=lambda x: x[0])
@@ -271,7 +273,7 @@ def _group_telnet_by_ip(log_dir):
         attempt_num = 0
         prev_ms = None
         for ms, kind, text in events:
-            if prev_ms is None or (ms - prev_ms) > TELNET_SESSION_GAP_SEC * 1000:
+            if prev_ms is None or (ms - prev_ms) > gap_ms:
                 attempt_num += 1
                 label = datetime.fromtimestamp(
                     ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")

@@ -393,6 +393,45 @@ class TestTelnetAggregatedLoader:
         assert "UTC" in marker["text"]
 
 
+class TestTelnetGapEnvVar:
+    """NETWATCH_TELNET_GAP_SEC is read at call time (not import time)."""
+
+    def test_default_when_unset(self, monkeypatch):
+        monkeypatch.delenv("NETWATCH_TELNET_GAP_SEC", raising=False)
+        assert replay._telnet_gap_sec() == 300
+
+    def test_env_override_widens_gap(self, monkeypatch, tmp_path):
+        # Two attempts 10 min apart — default 300s gap → 2 markers.
+        events = [
+            _telnet_event("2026-06-02T02:00:00+00:00", "7.7.7.7", username="root"),
+            _telnet_event("2026-06-02T02:10:00+00:00", "7.7.7.7", username="admin"),
+        ]
+        _write_all_events(tmp_path, events)
+        monkeypatch.delenv("NETWATCH_TELNET_GAP_SEC", raising=False)
+        # Force the index cache to expire so the fixture's gap takes effect.
+        replay._index_cache.update({"at": 0.0, "data": None, "dir": None, "dir_mtime": 0.0})
+        tl_default = replay.replay_loader("all_7.7.7.7", protocol="telnet",
+                                          log_dir=str(tmp_path))
+        markers_default = [e for e in tl_default["events"] if e["kind"] == "connect"]
+        assert len(markers_default) == 2
+
+        # Bump gap to 24h → one marker covering both attempts.
+        monkeypatch.setenv("NETWATCH_TELNET_GAP_SEC", "86400")
+        replay._index_cache.update({"at": 0.0, "data": None, "dir": None, "dir_mtime": 0.0})
+        tl_wide = replay.replay_loader("all_7.7.7.7", protocol="telnet",
+                                       log_dir=str(tmp_path))
+        markers_wide = [e for e in tl_wide["events"] if e["kind"] == "connect"]
+        assert len(markers_wide) == 1
+
+    def test_invalid_env_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv("NETWATCH_TELNET_GAP_SEC", "notanumber")
+        assert replay._telnet_gap_sec() == 300
+
+    def test_negative_clamped_to_minimum(self, monkeypatch):
+        monkeypatch.setenv("NETWATCH_TELNET_GAP_SEC", "-50")
+        assert replay._telnet_gap_sec() == 1
+
+
 class TestTelnetReplayLoader:
     def test_loads_login_events_as_timeline(self, tmp_path):
         events = [
