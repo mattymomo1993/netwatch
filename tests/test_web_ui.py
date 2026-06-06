@@ -1167,9 +1167,11 @@ class TestAnsiInjectionProtection:
 class TestSecurityHeaders:
     """Web responses must include anti-clickjacking and anti-sniffing headers."""
 
-    def test_x_frame_options_deny(self, web_client):
+    def test_x_frame_options_sameorigin(self, web_client):
+        # SAMEORIGIN lets the dashboard embed /replay/<sid> in an iframe while
+        # still blocking cross-site framing (clickjacking protection intact).
         resp = web_client.get("/")
-        assert resp.headers.get("X-Frame-Options") == "DENY"
+        assert resp.headers.get("X-Frame-Options") == "SAMEORIGIN"
 
     def test_x_content_type_options(self, web_client):
         resp = web_client.get("/")
@@ -1191,7 +1193,7 @@ class TestSecurityHeaders:
 
     def test_headers_on_api_endpoint(self, web_client):
         resp = web_client.get("/api/state")
-        assert resp.headers.get("X-Frame-Options") == "DENY"
+        assert resp.headers.get("X-Frame-Options") == "SAMEORIGIN"
         assert resp.headers.get("X-Content-Type-Options") == "nosniff"
 
     def test_after_request_present_in_source(self):

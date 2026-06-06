@@ -41,3 +41,17 @@ Thumbs.db
 dist/
 build/
 *.egg-info/
+
+# License key material — NEVER commit
+tools/.keygen_private.key
+tools/keygen_private.key
+*.license.dat
+
+# Pro tier — private, do not publish
+pro_beta/
+netwatch
+pro_beta_snapshots/
+
+# VPS / deploy notes — environment-specific, do not publish
+docs/VPS_*
+docs/private/

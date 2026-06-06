@@ -3,7 +3,8 @@
 NetWatch v2.0 - Unified Network Security Dashboard
 ════════════════════════════════════════════════════
 Modules:
-  HONEYPOT  - Fake NVR panel (:8080), DVR telnet (:2323), RTSP camera (:8554)
+  HONEYPOT  - Fake NVR panel, DVR telnet, RTSP camera, FTP bait
+              (defaults :8080/:2323/:2121/:8554, override via NETWATCH_*_PORT env)
   TRAFFIC   - Live packet capture via tshark + raw sockets
   SCANNER   - On-demand nmap scans from dashboard
   CAPTURE   - tcpdump pcap recording
@@ -29,7 +30,7 @@ import threading
 import subprocess
 from datetime import datetime, timezone
 from collections import defaultdict, deque
-from flask import Flask, request, render_template_string, redirect, jsonify
+from flask import Flask, Response, request, render_template_string, redirect, jsonify
 from markupsafe import escape as _escape
 
 try:
@@ -45,6 +46,8 @@ try:
     import dns.reversename
 except ImportError:
     dns = None
+
+import replay  # session-replay data layer (replay.py)
 
 # ─── Config ──────────────────────────────────────────────
 
@@ -66,7 +69,15 @@ for _i, _a in enumerate(sys.argv):
     if _a == "--token" and _i + 1 < len(sys.argv):
         _cli_token = sys.argv[_i + 1]
         break
-VERSION = "1.0.0"
+VERSION = "1.1.0"
+
+# Honeypot listener ports — overridable via env so deployments can move to
+# standard ports (80/23/21/554) without local sed against the repo.
+# CAP_NET_BIND_SERVICE or root required for ports <1024.
+HTTP_PORT   = int(os.environ.get("NETWATCH_HTTP_PORT",   "8080"))
+TELNET_PORT = int(os.environ.get("NETWATCH_TELNET_PORT", "2323"))
+FTP_PORT    = int(os.environ.get("NETWATCH_FTP_PORT",    "2121"))
+RTSP_PORT   = int(os.environ.get("NETWATCH_RTSP_PORT",   "8554"))
 
 # ─── Colors ──────────────────────────────────────────────
 
@@ -300,6 +311,14 @@ def log_event(service, ip, data):
     if mesh_alert_fwd and mesh_interface and service in ("credential", "malware_attempt", "ftp_upload"):
         threading.Thread(target=_mesh_forward_alert, args=(f"{service} from {ip}: {short}",), daemon=True).start()
 
+    # CrowdSec hand-off (no-op if cscli missing). Runs OUTSIDE both locks.
+    if os.environ.get("NETWATCH_AUTODEFEND", "1") == "1":
+        try:
+            from netwatch_crowdsec import maybe_defend as _cs_defend
+            threading.Thread(target=_cs_defend, args=(service, ip), daemon=True).start()
+        except ImportError:
+            pass
+
 def _short_summary(service, ip, data):
     if service == "credential":
         pw = data.get('password') or ''
@@ -464,6 +483,38 @@ def logout():
         del _session_store[ip]
     return redirect("/login")
 
+@app.route("/cam<int:cam_n>.mp4")
+@app.route("/cam<int:cam_n>.h264")
+@app.route("/video.mp4")
+@app.route("/stream.mp4")
+@app.route("/Streaming/Channels/<int:cam_n>")
+@app.route("/cgi-bin/snapshot.cgi")
+def fake_cam_feed(cam_n=1):
+    """Tarpit: trickles looped video at a rate-limited speed. Scanners
+    pulling these endpoints burn bandwidth + hold a socket. Logs total bytes
+    consumed when the connection finally closes."""
+    ip = request.remote_addr
+    if not _tarpit_should_trickle(ip):
+        return "404 Not Found", 404
+    log_event("http_tarpit_start", ip, {
+        "cam": cam_n, "path": request.path,
+        "ua": request.headers.get("User-Agent", "")[:200],
+    })
+
+    def gen():
+        bytes_sent = 0
+        try:
+            for buf, _ in _tarpit_chunks():
+                yield buf
+                bytes_sent += len(buf)
+        finally:
+            log_event("http_tarpit_end", ip, {
+                "cam": cam_n, "bytes_sent": bytes_sent,
+            })
+
+    return Response(gen(), mimetype="video/mp4")
+
+
 @app.route("/<path:path>", methods=["GET", "POST", "PUT", "DELETE"])
 def catch_all(path):
     log_event("scan_probe", request.remote_addr, {
@@ -492,7 +543,8 @@ def _honeypot_listener(service, port, handler):
         except Exception:
             pass
 
-def telnet_honeypot(port=2323):
+def telnet_honeypot(port=None):
+    if port is None: port = TELNET_PORT
     _honeypot_listener("telnet", port, handle_telnet)
 
 def handle_telnet(client, addr):
@@ -565,9 +617,86 @@ def handle_telnet(client, addr):
             _service_conns["telnet"] = max(0, _service_conns["telnet"] - 1)
         client.close()
 
+# -- HONEYPOT TARPIT — looped video over RTSP + HTTP fake-cam routes
+#
+# After credential capture, instead of dropping the attacker we trickle bytes
+# from a looped MP4 (cat_loop.mp4 by default) at a rate-limited speed. Burns
+# their bandwidth, holds their socket, proves intent in the log (a port-scan
+# bot won't sit and pull video bytes; a real intruder will).
+#
+# Configurable via env so operators can disable, swap the file, or change the
+# trickle rate without code edits. File missing → tarpit returns 0 bytes,
+# normal honeypot flow continues.
+
+TARPIT_VIDEO_PATH = os.environ.get(
+    "NETWATCH_TARPIT_VIDEO",
+    os.path.join(BASE_DIR, "cat_loop.mp4"),
+)
+# Bytes-per-second target. Default 10 KB/s — slow enough that scanners give
+# up or pile their socket pool, fast enough that we don't trip ssh keepalive.
+TARPIT_BYTES_PER_SEC = max(
+    1024, int(os.environ.get("NETWATCH_TARPIT_RATE", "10240"))
+)
+# Hard upper bound so we don't leak threads if attacker leaves connection open.
+TARPIT_MAX_SEC = max(
+    1, int(os.environ.get("NETWATCH_TARPIT_MAX_SEC", "3600"))
+)
+# Set to "0" to disable both RTSP + HTTP tarpit and fall back to original behavior.
+TARPIT_ENABLED = os.environ.get("NETWATCH_TARPIT", "1") != "0"
+
+
+def _tarpit_should_trickle(ip):
+    """Skip tarpit for our own/whitelisted IPs so the operator's NVR scanner
+    or uptime checker doesn't get caught in it."""
+    if not TARPIT_ENABLED:
+        return False
+    if not os.path.exists(TARPIT_VIDEO_PATH):
+        return False
+    try:
+        if os.path.getsize(TARPIT_VIDEO_PATH) < 1024:
+            return False
+    except OSError:
+        return False
+    if ip in WHITELIST_SCAN:
+        return False
+    for pref in WHITELIST_PREFIXES:
+        if ip.startswith(pref):
+            return False
+    return True
+
+
+def _tarpit_chunks():
+    """Generator over the video file at a rate-limited speed. Loops on EOF.
+    Stops when TARPIT_MAX_SEC elapses or the consumer closes the connection.
+
+    Yields (chunk, elapsed_s) tuples so callers can track bytes_sent / decide
+    when to bail without re-reading wall-clock themselves.
+    """
+    rate = TARPIT_BYTES_PER_SEC
+    chunk_size = max(256, rate // 10)
+    delay = chunk_size / rate
+    start = time.monotonic()
+    deadline = start + TARPIT_MAX_SEC
+    try:
+        with open(TARPIT_VIDEO_PATH, "rb") as f:
+            while True:
+                now = time.monotonic()
+                if now >= deadline:
+                    return
+                buf = f.read(chunk_size)
+                if not buf:
+                    f.seek(0)
+                    continue
+                yield buf, now - start
+                time.sleep(delay)
+    except (FileNotFoundError, PermissionError, OSError):
+        return
+
+
 # -- HONEYPOT - RTSP
 
-def rtsp_honeypot(port=8554):
+def rtsp_honeypot(port=None):
+    if port is None: port = RTSP_PORT
     _honeypot_listener("rtsp", port, handle_rtsp)
 
 def handle_rtsp(client, addr):
@@ -581,6 +710,34 @@ def handle_rtsp(client, addr):
         data2 = client.recv(4096).decode(errors="replace")
         if data2:
             log_event("rtsp_auth", addr[0], {"port": addr[1], "auth_request": data2[:500]})
+            # Tarpit: pretend the auth worked, ship SDP, then trickle MP4 bytes
+            # so the scanner burns bandwidth and we log every byte they consume.
+            if _tarpit_should_trickle(addr[0]):
+                sdp = (
+                    "v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\ns=NVR-Stream\r\n"
+                    "c=IN IP4 0.0.0.0\r\nt=0 0\r\n"
+                    "m=video 0 RTP/AVP 26\r\na=rtpmap:26 JPEG/90000\r\n"
+                )
+                hdr = (
+                    f"RTSP/1.0 200 OK\r\nCSeq: 2\r\n"
+                    f"Content-Type: application/sdp\r\n"
+                    f"Content-Length: {len(sdp)}\r\n\r\n{sdp}"
+                )
+                try:
+                    client.sendall(hdr.encode())
+                except OSError:
+                    return
+                client.settimeout(TARPIT_MAX_SEC)
+                bytes_sent = 0
+                for buf, _ in _tarpit_chunks():
+                    try:
+                        client.sendall(buf)
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        break
+                    bytes_sent += len(buf)
+                log_event("rtsp_tarpit", addr[0], {
+                    "port": addr[1], "bytes_sent": bytes_sent,
+                })
     except Exception:
         pass
     finally:
@@ -608,13 +765,15 @@ FTP_FILES = {
     "/logs": ["access.log", "auth.log", "system.log"],
 }
 
-def ftp_honeypot(port=2121):
+def ftp_honeypot(port=None):
+    if port is None: port = FTP_PORT
     _honeypot_listener("ftp", port, handle_ftp)
 
 def handle_ftp(client, addr):
     client.settimeout(60)
     ip = addr[0]
-    session_id = f"{ip}_{datetime.now().strftime('%H%M%S')}"
+    # microsecond suffix so back-to-back connects from one IP don't share a log file
+    session_id = f"{ip}_{datetime.now().strftime('%H%M%S_%f')}"
     session_log = os.path.join(LOG_DIR, f"ftp_session_{session_id}.log")
     cwd = "/"
     username = ""
@@ -632,15 +791,17 @@ def handle_ftp(client, addr):
     threading.Thread(target=_ftp_auto_recon, args=(ip,), daemon=True).start()
 
     def send(msg):
+        sent_ok = True
         try:
             client.send((msg + "\r\n").encode())
         except Exception:
-            pass
+            sent_ok = False
+        ftp_log("SERVER" if sent_ok else "SERVER_FAIL", msg)
 
     def ftp_log(direction, data):
-        """Log every single byte exchanged — JSON-safe, truncated"""
+        """Log every single byte exchanged — JSON-safe, truncated, newline-escaped"""
         ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-        safe_data = _ansi_strip(str(data)[:MAX_LOG_FIELD])
+        safe_data = _ansi_strip(str(data)[:MAX_LOG_FIELD]).replace("\r", "\\r").replace("\n", "\\n")
         entry = json.dumps({"ts": ts, "dir": direction, "data": safe_data})
         with _log_lock:
             with open(session_log, "a") as f:
@@ -652,7 +813,6 @@ def handle_ftp(client, addr):
 
     try:
         send("220 NVR-4200 FTP Service v4.3 Ready.")
-        ftp_log("SERVER", "220 banner sent")
         _ftp_cmd_count = 0
 
         while True:
@@ -664,7 +824,16 @@ def handle_ftp(client, addr):
                 raw = client.recv(4096)
                 if not raw:
                     break
-                cmd_line = raw.decode(errors="replace").strip()
+                # if the first few bytes aren't printable ASCII it's almost certainly
+                # a TLS ClientHello or other binary probe — log it as hex instead of
+                # decoding to mojibake. handshake bytes 0x16 0x03 0x0X are the giveaway.
+                head = raw[:4]
+                if any(b < 0x09 or (0x0e <= b < 0x20) or b >= 0x80 for b in head):
+                    preview = raw[:64].hex()
+                    ftp_log("CLIENT_BINARY", f"{len(raw)} bytes hex={preview}")
+                    send("502 Command not implemented.")
+                    continue
+                cmd_line = raw.decode("ascii", errors="replace").strip()
             except Exception:
                 break
 
@@ -682,7 +851,6 @@ def handle_ftp(client, addr):
                 username = arg
                 log_event("ftp_credential", ip, {"username": username, "stage": "USER"})
                 send(f"331 Password required for {username}.")
-                ftp_log("SERVER", f"331 password required for {username}")
 
             elif cmd == "PASS":
                 log_event("ftp_credential", ip, {
@@ -693,7 +861,6 @@ def handle_ftp(client, addr):
                 # Let them in to collect more intel
                 authenticated = True
                 send("230 Login successful.")
-                ftp_log("SERVER", "230 login ok (honeypot)")
 
                 with lock:
                     alerts.append({"time": datetime.now().strftime("%H:%M:%S"),
@@ -746,7 +913,8 @@ def handle_ftp(client, addr):
                 _pasv_ready.wait(timeout=5)
                 if data_sock:
                     try:
-                        data_sock.send(listing.encode())
+                        data_sock.sendall(listing.encode())
+                        ftp_log("DATA_SEND", f"LIST {len(listing)} bytes: {listing[:500]}")
                         data_sock.close()
                     except Exception:
                         pass
@@ -778,7 +946,9 @@ def handle_ftp(client, addr):
                     if data_sock:
                         try:
                             with open(real_path, "rb") as rf:
-                                data_sock.send(rf.read())
+                                file_data = rf.read()
+                            data_sock.sendall(file_data)
+                            ftp_log("DATA_SEND", f"RETR {filename} {len(file_data)} bytes from {real_path}")
                             data_sock.close()
                         except Exception:
                             pass
@@ -865,7 +1035,7 @@ def handle_ftp(client, addr):
                 passive_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 passive_sock.bind(("0.0.0.0", 0))
                 passive_sock.listen(1)
-                passive_sock.settimeout(10)
+                passive_sock.settimeout(5)
                 _, pasv_port = passive_sock.getsockname()
                 p1 = pasv_port >> 8
                 p2 = pasv_port & 0xFF
@@ -889,6 +1059,10 @@ def handle_ftp(client, addr):
                             data_sock = None
                         else:
                             data_sock = conn
+                    except socket.timeout:
+                        # attacker requested PASV but never opened the data channel
+                        ftp_log("PASV_TIMEOUT", f"no data conn within 5s on port {pasv_port}")
+                        data_sock = None
                     except Exception:
                         data_sock = None
                     finally:
@@ -935,7 +1109,8 @@ def handle_ftp(client, addr):
                     send(f"500 Unknown SITE command '{site_sub}'.")
 
             else:
-                ftp_log("UNKNOWN", cmd_line)
+                # CLIENT line already captured cmd_line; SERVER 502 below documents the reject.
+                # no need for a duplicate UNKNOWN entry.
                 send("502 Command not implemented.")
 
     except Exception as e:
@@ -2404,7 +2579,8 @@ from dataclasses import dataclass
 SCREEN_DASHBOARD = "dashboard"
 SCREEN_CLI = "cli"
 SCREEN_CONSOLE = "console"
-SCREENS = (SCREEN_DASHBOARD, SCREEN_CLI, SCREEN_CONSOLE)
+SCREEN_REPLAY = "replay"
+SCREENS = (SCREEN_DASHBOARD, SCREEN_CLI, SCREEN_CONSOLE, SCREEN_REPLAY)
 
 
 def _get_terminal_dims():
@@ -2439,6 +2615,14 @@ class AppState:
     dash_focus: int = 0
     last_screen: str = SCREEN_DASHBOARD  # toggle-back target
     needs_clear: bool = False  # one-shot \033[2J before next paint
+    # Replay screen state (None until a session is loaded)
+    replay_session_id: str = ""
+    replay_protocol: str = "ftp"          # "ftp" | "telnet"
+    replay_timeline: dict = None          # dict from replay.replay_loader(); intel attached under 'intel'
+    replay_cursor_ms: int = 0
+    replay_playing: bool = False
+    replay_speed: float = 1.0             # 0.25 / 0.5 / 1 / 2 / 4 / 8
+    replay_last_tick: float = 0.0         # time.monotonic() of last advance
 
     def switch(self, target: str) -> None:
         if target not in SCREENS or target == self.current_screen:
@@ -2537,6 +2721,7 @@ _HELP_SECTIONS = [
         ("clear", "Clear screen"), ("help", "This reference"),
         ("rotate-key", "New Fernet key (invalidate sessions)"),
         ("rotate-token", "New web auth token"),
+        ("show-token", "Print current web auth token + file path"),
     ]),
 ]
 
@@ -2637,6 +2822,87 @@ def _resolve_target(token):
     return token
 
 
+_replay_last_index = []
+_replay_index_lock = threading.Lock()  # protects _replay_last_index — concurrent TUI + web access
+
+
+def _disp_replay(parts):
+    global _replay_last_index
+    sub = parts[1].lower() if len(parts) >= 2 else "list"
+
+    if sub == "list" or len(parts) < 2:
+        try:
+            rows = replay.replay_index()
+        except Exception as e:
+            add_console(f"{RED}replay: index failed: {e}{RESET}")
+            return
+        if not rows:
+            add_console(f"{DIM}No captured sessions yet. Run the honeypots and wait for traffic.{RESET}")
+            with _replay_index_lock:
+                _replay_last_index = []
+            return
+        top = rows[:20]
+        with _replay_index_lock:
+            _replay_last_index = top
+        add_console(f"{BOLD}{CYAN}CAPTURED SESSIONS — top {len(top)} of {len(rows)}{RESET}")
+        add_console(f"  {DIM}#   session_id                        proto  ip               events   started_at{RESET}")
+        for i, r in enumerate(top, 1):
+            # Defense vs ANSI injection — IP/sid derived from attacker packets.
+            sid = _safe_text(r.get("session_id") or "")[:34]
+            proto = _safe_text(r.get("protocol") or "")[:6]
+            ip = _safe_text(r.get("ip") or "")[:15]
+            evc = _safe_text(str(r.get("event_count", "")))[:7]
+            started = _safe_text(r.get("started_at_mtime") or "")[:19]
+            add_console(f"  {i:<3} {sid:<34} {proto:<6} {ip:<15} {evc:<8} {started}")
+        add_console(f"{DIM}  → `replay <#>` or `replay <session_id> [ftp|telnet]` to load{RESET}")
+        return
+
+    raw = parts[1]
+    proto = parts[2].lower() if len(parts) >= 3 else None
+
+    sid = None
+    chosen_proto = proto or "ftp"
+    if raw.isdigit():
+        idx = int(raw) - 1
+        # Snapshot under lock so a concurrent `replay list` can't tear the read.
+        with _replay_index_lock:
+            snapshot = list(_replay_last_index)
+        if not (0 <= idx < len(snapshot)):
+            add_console(f"{RED}replay: index {raw} out of range — run `replay list` first{RESET}")
+            return
+        row = snapshot[idx]
+        sid = row.get("session_id")
+        if not proto:
+            chosen_proto = row.get("protocol") or "ftp"
+    else:
+        sid = raw
+
+    try:
+        timeline = replay.replay_loader(sid, protocol=chosen_proto)
+        timeline["intel"] = replay.load_intel(timeline.get("ip", ""))
+    except FileNotFoundError as e:
+        add_console(f"{RED}replay: session not found: {e}{RESET}")
+        return
+    except ValueError as e:
+        add_console(f"{RED}replay: {e}{RESET}")
+        return
+    except Exception as e:
+        add_console(f"{RED}replay: load failed: {e}{RESET}")
+        return
+
+    app_state.replay_session_id = sid
+    app_state.replay_protocol = chosen_proto
+    app_state.replay_timeline = timeline
+    app_state.replay_cursor_ms = 0
+    app_state.replay_playing = False
+    app_state.replay_speed = 1.0
+    app_state.replay_last_tick = time.monotonic()
+    app_state.switch(SCREEN_REPLAY)
+    add_console(f"{GREEN}replay: loaded {sid} ({chosen_proto}) — {len(timeline.get('events', []))} events, "
+                f"{timeline.get('duration_ms', 0)/1000:.1f}s{RESET}")
+    _redraw_event.set()
+
+
 def handle_command(cmd):
     global current_tab, console_mode, proxy_rotation
     parts = cmd.strip().split()
@@ -2711,7 +2977,7 @@ def handle_command(cmd):
         "subnet": (1, _disp_subnet), "pcap": (1, _disp_pcap),
         "blockall": (1, _disp_blockall), "tag": (1, _disp_tag), "note": (1, _disp_note),
         "watch": (1, _disp_watch), "mesh": (1, _disp_mesh), "ifinfo": (1, _disp_ifinfo),
-        "proxy": (1, _disp_proxy),
+        "proxy": (1, _disp_proxy), "replay": (1, _disp_replay),
     }
 
     if action in _DIRECT_CMDS:
@@ -2782,6 +3048,8 @@ def handle_command(cmd):
         _disp_rotate_key()
     elif action in ("rotate-token", "rotatetoken"):
         _disp_rotate_token()
+    elif action in ("show-token", "showtoken", "token"):
+        _disp_show_token()
     else:
         add_console(f"{RED}Unknown: '{action}'. Type 'help' for commands.{RESET}")
 
@@ -2796,6 +3064,13 @@ def _disp_rotate_key():
         add_console(f"{GREEN}Web encryption key rotated — all sessions invalidated.{RESET}")
     except Exception as e:
         add_console(f"{RED}Key rotation failed: {_safe_error(e)}{RESET}")
+
+
+def _disp_show_token():
+    """Print the current full WEB_TOKEN and its on-disk path."""
+    add_console(f"{YELLOW}Web Token : {WEB_TOKEN}{RESET}")
+    add_console(f"{DIM}File      : {_TOKEN_PATH} (0600){RESET}")
+    add_console(f"{DIM}Use this token to log into the web dashboard.{RESET}")
 
 
 def _disp_rotate_token():
@@ -4393,8 +4668,8 @@ def _build_frame(cols=80, max_content=35, active_tab=None):
 
     # Services
     svcs = [
-        ("HTTP:8080", GREEN), ("TELNET:2323", GREEN),
-        ("FTP:2121", GREEN), ("RTSP:8554", GREEN),
+        (f"HTTP:{HTTP_PORT}", GREEN), (f"TELNET:{TELNET_PORT}", GREEN),
+        (f"FTP:{FTP_PORT}", GREEN), (f"RTSP:{RTSP_PORT}", GREEN),
         (f"SNIFF:{IFACE}", GREEN),
     ]
     tshark_ok = len(tshark_conversations) > 0
@@ -4628,6 +4903,242 @@ def _paint_console():
     _write_frame(buf)
 
 
+_REPLAY_SPEED_STEPS = (0.25, 0.5, 1.0, 2.0, 4.0, 8.0)
+
+# Strip every C0 control char (except plain SP/TAB), DEL, and any ANSI/OSC
+# escape so attacker-supplied recon/event text can't hijack the operator's
+# terminal (clear screen, OSC-52 clipboard write, fake prompt, etc.).
+_ANSI_STRIP_RE = re.compile(
+    r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?"  # OSC ... BEL or ST
+    r"|\x1b\[[0-?]*[ -/]*[@-~]"            # CSI
+    r"|\x1b[@-Z\\-_]"                      # 7-bit single ESC sequences
+    r"|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]"   # C0 (minus \t \n \r) + DEL
+)
+
+
+def _safe_text(s, allow_newlines=False):
+    """Return s with ANSI/control sequences removed. Defense vs terminal hijack."""
+    if s is None:
+        return ""
+    t = _ANSI_STRIP_RE.sub("", str(s))
+    if not allow_newlines:
+        t = t.replace("\n", " ").replace("\r", "")
+    return t
+
+
+def _replay_fmt_ms(ms):
+    if ms is None or ms < 0:
+        ms = 0
+    s, msr = divmod(int(ms), 1000)
+    m, s = divmod(s, 60)
+    return f"{m:02d}:{s:02d}.{msr:03d}"
+
+
+def _replay_event_color(kind):
+    k = (kind or "").lower()
+    if k in ("client", "cmd", "login"):
+        return CYAN
+    if k == "server":
+        return GREEN
+    if k in ("cred", "credential"):
+        return RED
+    if k == "malware":
+        return YELLOW
+    if k == "connect":
+        return BLUE
+    return ""
+
+
+def _replay_advance_cursor():
+    now = time.monotonic()
+    last = app_state.replay_last_tick or now
+    app_state.replay_last_tick = now
+    if not app_state.replay_playing:
+        return
+    tl = app_state.replay_timeline
+    if not tl:
+        return
+    dur = int(tl.get("duration_ms") or 0)
+    if dur <= 0:
+        app_state.replay_playing = False
+        return
+    delta = (now - last) * 1000.0 * float(app_state.replay_speed)
+    app_state.replay_cursor_ms = int(app_state.replay_cursor_ms + delta)
+    if app_state.replay_cursor_ms >= dur:
+        app_state.replay_cursor_ms = dur
+        app_state.replay_playing = False
+
+
+def _paint_replay():
+    _replay_advance_cursor()
+    cols, rows = _get_terminal_dims()
+    cols = max(60, cols)
+    rows = max(12, rows)
+
+    tl = app_state.replay_timeline
+    buf = "\033[?25l\033[H"
+
+    if not tl:
+        title = f"{BOLD}{RED}  NETWATCH — REPLAY{RESET}  {DIM}(no session loaded){RESET}"
+        buf += title + "\033[K\n"
+        buf += f"{DIM}{'─'*min(cols, 78)}{RESET}\033[K\n"
+        msg = [
+            "",
+            f"  {DIM}No replay session loaded.{RESET}",
+            "",
+            f"  Type {GREEN}replay list{RESET} to see captured sessions,",
+            f"  then {GREEN}replay <#>{RESET} or {GREEN}replay <session_id>{RESET} to load one.",
+            "",
+            f"  {DIM}[q] back to dashboard{RESET}",
+        ]
+        for line in msg:
+            buf += line + "\033[K\n"
+        for _ in range(rows - 2 - len(msg)):
+            buf += "\033[K\n"
+        _write_frame(buf)
+        return
+
+    # All session/timeline strings are attacker-influenceable (session_id derived
+    # from connect IP; ip via PTR; event text from raw bytes). Sanitize every
+    # value that touches the terminal — strips ANSI/OSC/control sequences.
+    sid = _safe_text(tl.get("session_id", ""))
+    proto = _safe_text(tl.get("protocol", app_state.replay_protocol))
+    ip = _safe_text(tl.get("ip", ""))
+    dur = int(tl.get("duration_ms") or 0)
+    cur = max(0, min(int(app_state.replay_cursor_ms), dur))
+    events = tl.get("events") or []
+    intel = tl.get("intel") or {}
+
+    side_w = 22 if cols >= 80 else 0
+    main_w = cols - side_w - (1 if side_w else 0)
+
+    end_tag = f"  {BOLD}{YELLOW}[END]{RESET}" if (not app_state.replay_playing and cur >= dur and dur > 0) else ""
+    title = f"{BOLD}{RED}  NETWATCH — REPLAY{RESET}  {DIM}{sid}{RESET}{end_tag}"
+    buf += title + "\033[K\n"
+    buf += f"{DIM}{'─'*min(cols, 78)}{RESET}\033[K\n"
+
+    meta = (f"  {DIM}proto:{RESET} {proto}   {DIM}ip:{RESET} {ip}   "
+            f"{DIM}duration:{RESET} {_replay_fmt_ms(dur)}   "
+            f"{DIM}events:{RESET} {len(events)}")
+    buf += meta + "\033[K\n"
+
+    body_rows = max(4, rows - 6)
+
+    cur_idx = -1
+    for i, e in enumerate(events):
+        if int(e.get("t_ms", 0)) <= cur:
+            cur_idx = i
+        else:
+            break
+
+    show = body_rows
+    if len(events) <= show:
+        start = 0
+    else:
+        anchor = max(0, cur_idx - (show * 2 // 3))
+        start = min(anchor, len(events) - show)
+        start = max(0, start)
+    end = min(len(events), start + show)
+    window = events[start:end]
+
+    side_lines = []
+    if side_w:
+        def _pad(label, val):
+            # Strip ANSI/control from every intel value before truncation.
+            v = _safe_text("" if val is None else val)[:side_w - len(label) - 2]
+            return f"{DIM}{label}{RESET}{v}"
+        if intel:
+            side_lines.append(f"{BOLD}{WHITE}INTEL{RESET}")
+            side_lines.append(_pad("Country: ", intel.get("country") or "—"))
+            side_lines.append(_pad("ASN:     ", intel.get("asn") or "—"))
+            side_lines.append(_pad("Org:     ", intel.get("org") or "—"))
+            side_lines.append(_pad("Abuse:   ", intel.get("abuse_score") or "—"))
+            tags = intel.get("tags") or []
+            safe_tags = ", ".join(_safe_text(t) for t in tags)
+            side_lines.append(_pad("Tags:    ", safe_tags[:side_w - 10] if safe_tags else "—"))
+            host = intel.get("hostname") or ""
+            if host:
+                side_lines.append(_pad("Host:    ", host))
+            notes = intel.get("notes") or ""
+            if notes:
+                side_lines.append("")
+                side_lines.append(f"{DIM}Notes:{RESET}")
+                s = _safe_text(notes)
+                while s and len(side_lines) < body_rows:
+                    side_lines.append(s[:side_w])
+                    s = s[side_w:]
+        else:
+            side_lines.append(f"{BOLD}{WHITE}INTEL{RESET}")
+            side_lines.append(f"{DIM}(no recon data){RESET}")
+            side_lines.append("")
+            side_lines.append(f"{DIM}Run `recon {ip}`")
+            side_lines.append(f"{DIM}from dashboard.{RESET}")
+        side_lines = side_lines[:body_rows]
+        while len(side_lines) < body_rows:
+            side_lines.append("")
+
+    for row in range(body_rows):
+        if row < len(window):
+            e = window[row]
+            ev_idx = start + row
+            t_ms = int(e.get("t_ms", 0))
+            kind = _safe_text((e.get("kind") or "").upper())[:8]
+            # Event text is attacker bytes (telnet username, FTP command, etc.).
+            # _safe_text strips C0/CSI/OSC before display.
+            text = _safe_text(e.get("text") or "")
+            future = t_ms > cur
+            color = _replay_event_color(e.get("kind"))
+            ts = _replay_fmt_ms(t_ms)
+            line = f"[{ts}] {kind:<8} {text}"
+            max_text = main_w - 4
+            if len(line) > max_text:
+                line = line[:max_text - 1] + "…"
+            marker = " "
+            if ev_idx == cur_idx:
+                marker = f"{BOLD}{WHITE}▶{RESET}"
+            if future:
+                rendered = f" {marker} {DIM}{line}{RESET}"
+            elif ev_idx == cur_idx:
+                rendered = f" {marker} {BOLD}{color}{line}{RESET}"
+            else:
+                rendered = f" {marker} {color}{line}{RESET}"
+            left_cell = rendered
+        elif row == 0 and not window:
+            left_cell = f"  {DIM}(no events captured){RESET}"
+        else:
+            left_cell = ""
+
+        visible_len = len(re.sub(r"\033\[[0-9;]*m", "", left_cell))
+        pad = max(0, main_w - visible_len)
+        out_line = left_cell + (" " * pad)
+
+        if side_w:
+            side_cell = side_lines[row]
+            s_vis = len(re.sub(r"\033\[[0-9;]*m", "", side_cell))
+            s_pad = max(0, side_w - s_vis)
+            out_line += f"{DIM}│{RESET}" + side_cell + (" " * s_pad)
+
+        buf += out_line + "\033[K\n"
+
+    bar_w = max(10, cols - 30)
+    filled = int(bar_w * (cur / dur)) if dur > 0 else bar_w
+    filled = max(0, min(filled, bar_w))
+    bar = ("█" * filled) + ("─" * (bar_w - filled))
+    play_tag = f"{GREEN}▶{RESET}" if app_state.replay_playing else f"{YELLOW}❚❚{RESET}"
+    spd_s = f"{app_state.replay_speed:g}x"
+    footer1 = f" {play_tag} {bar} {_replay_fmt_ms(cur)}/{_replay_fmt_ms(dur)}  {DIM}speed:{RESET} {spd_s}"
+    footer2 = (f" {DIM}[SPACE] play  [←→] ±1s  [</>] ±10s  [+-] speed  "
+               f"[Home/End] jump  [q] back{RESET}")
+    buf += footer1 + "\033[K\n"
+    buf += footer2 + "\033[K\n"
+
+    rendered_rows = 4 + body_rows + 2
+    for _ in range(max(0, rows - rendered_rows)):
+        buf += "\033[K\n"
+
+    _write_frame(buf)
+
+
 def _render_frame():
     # console_mode (legacy) suppresses all paint — caller owns the terminal.
     if console_mode or _input_active:
@@ -4648,6 +5159,8 @@ def _render_frame():
             _paint_cli()
         elif screen == SCREEN_CONSOLE:
             _paint_console()
+        elif screen == SCREEN_REPLAY:
+            _paint_replay()
         else:
             _paint_dashboard()
     finally:
@@ -4876,16 +5389,25 @@ def _web_auth():
         for _lip in LOCAL_IPS:
             _allowed_origins.add(f"http://{_lip}:{WEB_PORT}")
         _cf_origin = os.environ.get("NETWATCH_CF_ORIGIN", "")
+        # Loopback on any port — SSH tunnels remap ports (e.g. -L 9091:127.0.0.1:9090)
+        # and the same-origin policy already prevents foreign sites from issuing these.
+        _origin_lc = origin.lower()
+        _loopback_any_port = (_origin_lc.startswith("http://localhost:")
+                              or _origin_lc.startswith("http://127.0.0.1:"))
         if _cf_origin and origin == f"https://{_cf_origin}":
             pass
         elif origin.startswith("https://") and origin.endswith(".trycloudflare.com") and _verify_web_cookie(request.cookies.get("nw_token", "")):
+            pass
+        elif _loopback_any_port and _verify_web_cookie(request.cookies.get("nw_token", "")):
             pass
         elif origin not in _allowed_origins:
             return "CSRF rejected", 403
 
 @web_app.after_request
 def _security_headers(resp):
-    resp.headers["X-Frame-Options"] = "DENY"
+    # SAMEORIGIN allows the dashboard to embed /replay/<sid> in an iframe
+    # while still blocking cross-site framing (clickjacking protection).
+    resp.headers["X-Frame-Options"] = "SAMEORIGIN"
     resp.headers["X-Content-Type-Options"] = "nosniff"
     resp.headers["Referrer-Policy"] = "no-referrer"
     resp.headers["Cache-Control"] = "no-store"
@@ -5130,32 +5652,59 @@ WEB_DASHBOARD_HTML = r"""<!DOCTYPE html>
 *{margin:0;padding:0;box-sizing:border-box}
 :root{--bg:#080a0e;--surface:#0d1117;--border:#1a1f2b;--red:#ff3333;--green:#00ff88;
 --cyan:#00d4ff;--yellow:#ffcc00;--magenta:#ff66ff;--blue:#4488ff;--dim:#555;--text:#c8ccd4;
---panel-h:40vh}
+--panel-h:40vh;
+/* semantic aliases — components read these; theme switches still hit the literal vars */
+--accent:var(--red);--fg:var(--text);--muted:var(--dim);
+--threat-high:var(--red);--threat-med:var(--yellow);--threat-low:var(--green);
+--warn:var(--yellow);--info:var(--cyan);--good:var(--green);
+--svc-on-bg:#0a2a15;--svc-on-bd:#0f3d1e;
+--svc-warn-bg:#2a2a0a;--svc-warn-bd:#3d3d0f;
+--svc-off-bg:#1a0a0a;--svc-off-bd:#2a1515;--svc-off-fg:#663333;
+--header-grad-from:#12060a}
 .theme-matrix{--bg:#000;--surface:#001100;--border:#003300;--red:#00ff41;--green:#00ff41;
---cyan:#00ff41;--yellow:#33ff33;--magenta:#00ff41;--blue:#00ff41;--dim:#005500;--text:#00ff41}
+--cyan:#00ff41;--yellow:#33ff33;--magenta:#00ff41;--blue:#00ff41;--dim:#005500;--text:#00ff41;
+--svc-on-bg:#002200;--svc-on-bd:#004400;--svc-warn-bg:#002200;--svc-warn-bd:#004400;
+--svc-off-bg:#001100;--svc-off-bd:#002200;--svc-off-fg:#005500;--header-grad-from:#001100}
 .theme-midnight{--bg:#020617;--surface:#0f172a;--border:#1e3a5f;--red:#f43f5e;--green:#34d399;
---cyan:#38bdf8;--yellow:#fbbf24;--magenta:#a78bfa;--blue:#60a5fa;--dim:#475569;--text:#e0f2fe}
+--cyan:#38bdf8;--yellow:#fbbf24;--magenta:#a78bfa;--blue:#60a5fa;--dim:#475569;--text:#e0f2fe;
+--svc-on-bg:#053024;--svc-on-bd:#0a4a3a;--svc-warn-bg:#3a2a05;--svc-warn-bd:#5a420a;
+--svc-off-bg:#1a0a14;--svc-off-bd:#2a1525;--svc-off-fg:#6b3d4d;--header-grad-from:#1e0a16}
 .theme-cyberpunk{--bg:#050014;--surface:#111827;--border:#f97316;--red:#f97316;--green:#22d3ee;
---cyan:#22d3ee;--yellow:#f9a8d4;--magenta:#f9a8d4;--blue:#818cf8;--dim:#6b21a8;--text:#f9a8d4}
-.theme-light{--bg:#f9fafb;--surface:#ffffff;--border:#d1d5db;--red:#dc2626;--green:#059669;
---cyan:#0891b2;--yellow:#d97706;--magenta:#9333ea;--blue:#2563eb;--dim:#9ca3af;--text:#111827}
-#scanline-overlay{position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:9999;opacity:0}
+--cyan:#22d3ee;--yellow:#f9a8d4;--magenta:#f9a8d4;--blue:#818cf8;--dim:#6b21a8;--text:#f9a8d4;
+--svc-on-bg:#0a2030;--svc-on-bd:#1a3050;--svc-warn-bg:#301a30;--svc-warn-bd:#502a50;
+--svc-off-bg:#1a0a1a;--svc-off-bd:#2a152a;--svc-off-fg:#6b3d6b;--header-grad-from:#1a0530}
+.theme-light{--bg:#f9fafb;--surface:#ffffff;--border:#d1d5db;--red:#dc2626;--green:#047857;
+--cyan:#0e7490;--yellow:#b45309;--magenta:#7e22ce;--blue:#1d4ed8;--dim:#6b7280;--text:#111827;
+--svc-on-bg:#d1fae5;--svc-on-bd:#a7f3d0;--svc-warn-bg:#fef3c7;--svc-warn-bd:#fcd34d;
+--svc-off-bg:#fee2e2;--svc-off-bd:#fca5a5;--svc-off-fg:#991b1b;--header-grad-from:#fee2e2}
+#scanline-overlay{position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:50;opacity:0}
 #scanline-overlay.soft{opacity:1;background:repeating-linear-gradient(0deg,transparent,transparent 3px,rgba(0,0,0,.03) 3px,rgba(0,0,0,.03) 6px)}
 #scanline-overlay.heavy{opacity:1;background:repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,0,0,.08) 2px,rgba(0,0,0,.08) 4px)}
 @keyframes status-pulse{0%,100%{opacity:1}50%{opacity:.4}}
 .pulse{animation:status-pulse 1.5s ease-in-out infinite}
+@keyframes row-in{from{opacity:0;transform:translateY(-2px)}to{opacity:1;transform:none}}
+.fade-in tr,.fade-in .nw-row{animation:row-in .18s ease-out both}
+@keyframes spin{to{transform:rotate(360deg)}}
+.spinner{display:inline-block;width:10px;height:10px;border:2px solid var(--muted);
+border-top-color:var(--accent);border-radius:50%;animation:spin .9s linear infinite;vertical-align:-1px;margin-right:6px}
+.empty-state,.loading-state{padding:24px 12px;color:var(--muted);font-size:12px;
+text-align:left;border:1px dashed var(--border);border-radius:6px;background:rgba(255,255,255,.01);
+margin-top:4px}
+.empty-state .label,.loading-state .label{color:var(--fg);font-size:13px;margin-bottom:4px}
+.empty-state .hint{color:var(--muted);font-size:11px}
+.loading-state .label{color:var(--info)}
 body{background:var(--bg);color:var(--text);font-family:'JetBrains Mono','Fira Code',monospace;
 font-size:13px;overflow-x:hidden;min-height:100vh;display:flex;flex-direction:column}
-#header{background:linear-gradient(180deg,#12060a 0%,var(--surface) 100%);
-border-bottom:2px solid var(--red);padding:10px 20px;display:flex;align-items:center;gap:16px;flex-shrink:0}
+#header{background:linear-gradient(180deg,var(--header-grad-from) 0%,var(--surface) 100%);
+border-bottom:2px solid var(--accent);padding:10px 20px;display:flex;align-items:center;gap:16px;flex-shrink:0}
 #header h1{color:var(--red);font-size:18px;font-weight:700;letter-spacing:2px}
 .stat{color:var(--dim);font-size:11px}
 .stat b{color:var(--text)}
 .services{display:flex;gap:4px;margin-left:auto;flex-wrap:wrap}
 .svc{padding:2px 6px;border-radius:3px;font-size:9px;font-weight:600;text-transform:uppercase}
-.svc.on{background:#0a2a15;color:var(--green);border:1px solid #0f3d1e}
-.svc.warn{background:#2a2a0a;color:var(--yellow);border:1px solid #3d3d0f}
-.svc.off{background:#1a0a0a;color:#663333;border:1px solid #2a1515}
+.svc.on{background:var(--svc-on-bg);color:var(--good);border:1px solid var(--svc-on-bd)}
+.svc.warn{background:var(--svc-warn-bg);color:var(--warn);border:1px solid var(--svc-warn-bd)}
+.svc.off{background:var(--svc-off-bg);color:var(--svc-off-fg);border:1px solid var(--svc-off-bd)}
 #tabs{display:flex;gap:0;background:var(--surface);border-bottom:1px solid var(--border);
 padding:0 12px;flex-shrink:0;overflow-x:auto}
 .tab{padding:8px 14px;cursor:pointer;color:var(--dim);font-size:11px;font-weight:600;
@@ -5191,7 +5740,23 @@ display:flex;gap:10px;align-items:center;flex-shrink:0}
 #cmd-bar label{color:var(--red);font-weight:700;font-size:14px}
 #cmd-input{flex:1;background:var(--bg);border:1px solid var(--border);color:var(--text);
 font-family:inherit;font-size:13px;padding:7px 12px;border-radius:4px;outline:none}
-#cmd-input:focus{border-color:var(--red);box-shadow:0 0 8px rgba(255,51,51,.15)}
+#cmd-input:focus{border-color:var(--accent);box-shadow:0 0 8px rgba(255,51,51,.15)}
+.tab:focus-visible,button:focus-visible,select:focus-visible,
+.ctx-item:focus-visible,.panel-btn:focus-visible,.port-chip:focus-visible{
+outline:2px solid var(--accent);outline-offset:2px;border-radius:3px}
+[role="dialog"]{outline:none}
+#kbd-help{display:none;position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);
+background:var(--surface);border:1px solid var(--accent);border-radius:8px;padding:18px 22px;
+z-index:1100;min-width:280px;max-width:90vw;box-shadow:0 16px 48px rgba(0,0,0,.7)}
+#kbd-help.open{display:block}
+#kbd-help h3{color:var(--accent);font-size:12px;text-transform:uppercase;letter-spacing:1px;margin-bottom:10px}
+#kbd-help table{width:100%;font-size:12px}
+#kbd-help td{padding:3px 8px;border:none}
+#kbd-help kbd{background:var(--bg);border:1px solid var(--border);border-radius:3px;
+padding:1px 6px;font-family:inherit;font-size:11px;color:var(--info)}
+#kbd-help .close-hint{color:var(--muted);font-size:10px;margin-top:10px;text-align:right}
+.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;
+clip:rect(0,0,0,0);white-space:nowrap;border:0}
 .osint-geo{color:var(--cyan)}.osint-dns{color:var(--magenta)}.osint-scan{color:var(--green)}
 .osint-abuse{color:var(--red)}.osint-whois{color:var(--blue)}
 .ip-click{cursor:pointer;text-decoration:none;border-bottom:1px dashed rgba(0,212,255,.3);transition:all .15s}
@@ -5239,6 +5804,16 @@ background:rgba(0,212,255,.1);color:var(--cyan);border:1px solid rgba(0,212,255,
   #content{padding:10px}
   #detail-panel{width:95vw}
   #charts-grid{grid-template-columns:1fr !important}
+  #tabs{background:linear-gradient(90deg,var(--surface) 0%,var(--surface) 92%,rgba(0,0,0,.4) 100%)}
+  .panel-btn,.tab,.ctx-item{min-height:36px;display:flex;align-items:center}
+}
+@media(max-width:640px){
+  #detail-panel{width:100vw;max-width:100vw;height:100vh;max-height:100vh;
+    border-radius:0;border-width:0;top:0;left:0;transform:none}
+  #detail-panel.open{display:flex}
+  .panel-btn{min-width:44px;min-height:44px;justify-content:center}
+  #cmd-input{font-size:14px}
+  #kbd-help{width:100vw;max-width:100vw;border-radius:0;top:0;left:0;transform:none;height:100vh;overflow-y:auto}
 }
 ::-webkit-scrollbar{width:6px}
 ::-webkit-scrollbar-track{background:var(--bg)}
@@ -5254,13 +5829,16 @@ background:rgba(0,212,255,.1);color:var(--cyan);border:1px solid rgba(0,212,255,
   <span class="stat"><b id="s-hosts">0</b> hosts</span>
   <span class="stat" style="color:var(--dim)" id="s-time"></span>
   <div class="services" id="svc-bar"></div>
-  <select id="theme-sel" style="background:var(--surface);color:var(--text);border:1px solid var(--border);padding:3px 6px;font-size:10px;font-family:inherit;border-radius:3px;cursor:pointer" title="Theme">
+  <span class="sr-only" id="theme-sel-label">Theme</span>
+  <select id="theme-sel" aria-labelledby="theme-sel-label" style="background:var(--surface);color:var(--fg);border:1px solid var(--border);padding:3px 6px;font-size:10px;font-family:inherit;border-radius:3px;cursor:pointer" title="Theme">
     <option value="">Terminal</option><option value="theme-matrix">Matrix</option><option value="theme-midnight">Midnight</option><option value="theme-cyberpunk">Cyberpunk</option><option value="theme-light">Light</option>
   </select>
-  <select id="scanline-sel" style="background:var(--surface);color:var(--text);border:1px solid var(--border);padding:3px 6px;font-size:10px;font-family:inherit;border-radius:3px;cursor:pointer" title="CRT Scanlines">
+  <span class="sr-only" id="scan-sel-label">CRT scanlines</span>
+  <select id="scanline-sel" aria-labelledby="scan-sel-label" style="background:var(--surface);color:var(--fg);border:1px solid var(--border);padding:3px 6px;font-size:10px;font-family:inherit;border-radius:3px;cursor:pointer" title="CRT Scanlines">
     <option value="">CRT Off</option><option value="soft">CRT Soft</option><option value="heavy">CRT Heavy</option>
   </select>
-  <span class="pulse" style="width:8px;height:8px;border-radius:50%;background:var(--green);display:inline-block" title="Live"></span>
+  <button id="kbd-help-btn" title="Keyboard shortcuts (press ?)" aria-label="Show keyboard shortcuts" style="background:var(--surface);color:var(--fg);border:1px solid var(--border);padding:2px 8px;font-size:11px;font-family:inherit;border-radius:3px;cursor:pointer">?</button>
+  <span class="pulse" style="width:8px;height:8px;border-radius:50%;background:var(--good);display:inline-block" title="Live updates streaming" aria-label="Live updates streaming"></span>
 </div>
 <div id="scanline-overlay"></div>
 <div id="tabs"></div>
@@ -5277,24 +5855,38 @@ background:rgba(0,212,255,.1);color:var(--cyan);border:1px solid rgba(0,212,255,
   <input id="cmd-input" type="text" placeholder="Type command... (scan / geo / whois / recon / deep / help)  Press / to focus" autocomplete="off" spellcheck="false">
 </div>
 <div id="ctx-menu"></div>
-<div id="output-panel">
-  <div id="panel-drag"></div>
+<div id="output-panel" role="region" aria-label="Command output panel">
+  <div id="panel-drag" role="separator" aria-orientation="horizontal" aria-label="Resize output panel"></div>
   <div id="output-hdr">
     <span class="title" id="output-title">OUTPUT</span>
-    <span class="panel-btn" id="output-max" title="Maximize">&#9634;</span>
-    <span class="panel-btn" id="output-close" title="Close">&times;</span>
+    <button class="panel-btn" id="output-max" title="Maximize" aria-label="Maximize output panel">&#9634;</button>
+    <button class="panel-btn" id="output-close" title="Close" aria-label="Close output panel">&times;</button>
   </div>
   <div id="output-body"></div>
 </div>
-<div id="detail-panel">
+<div id="detail-panel" role="dialog" aria-modal="true" aria-labelledby="detail-title">
   <div id="detail-hdr">
     <span class="title" id="detail-title">HOST DETAIL</span>
-    <span class="panel-btn" id="detail-close">&times;</span>
+    <button class="panel-btn" id="detail-close" title="Close" aria-label="Close host detail">&times;</button>
   </div>
   <div id="detail-body"></div>
 </div>
+<div id="kbd-help" role="dialog" aria-modal="true" aria-labelledby="kbd-help-title">
+  <h3 id="kbd-help-title">Keyboard Shortcuts</h3>
+  <table>
+    <tr><td><kbd>1</kbd>–<kbd>9</kbd></td><td>Jump to tab</td></tr>
+    <tr><td><kbd>0</kbd></td><td>Proxy tab</td></tr>
+    <tr><td><kbd>Shift</kbd>+<kbd>M</kbd></td><td>Mesh tab</td></tr>
+    <tr><td><kbd>Shift</kbd>+<kbd>H</kbd></td><td>Help tab</td></tr>
+    <tr><td><kbd>R</kbd></td><td>Replay tab</td></tr>
+    <tr><td><kbd>/</kbd></td><td>Focus command bar</td></tr>
+    <tr><td><kbd>?</kbd></td><td>Toggle this overlay</td></tr>
+    <tr><td><kbd>Esc</kbd></td><td>Close any open panel</td></tr>
+  </table>
+  <div class="close-hint">Esc to close</div>
+</div>
 <script>
-const TABS=["all","hosts","proto","dns","honeypot","nmap","arp","alerts","osint","proxy","mesh","help"];
+const TABS=["all","hosts","proto","dns","honeypot","scan","nmap","arp","alerts","osint","proxy","mesh","replay","help"];
 let tab="all",D={};
 function $(s){return document.querySelector(s)}
 function $$(s){return document.querySelectorAll(s)}
@@ -5303,11 +5895,15 @@ function fmtBytes(b){for(const u of["B","KB","MB","GB"]){if(b<1024)return b.toFi
 
 function initTabs(){
   const c=$("#tabs");
+  c.setAttribute("role","tablist");
   TABS.forEach((t,i)=>{
-    const d=document.createElement("div");
+    const d=document.createElement("button");
     d.className="tab"+(t===tab?" active":"");
+    d.setAttribute("role","tab");
+    d.setAttribute("aria-selected",t===tab?"true":"false");
+    d.style.background="transparent";d.style.border="none";d.style.borderBottom="2px solid transparent";
     d.innerHTML=`<span class="n">${i<9?i+1:0}</span>${t.toUpperCase()}`;
-    d.onclick=()=>{tab=t;$$(".tab").forEach(x=>x.classList.remove("active"));d.classList.add("active");render()};
+    d.onclick=()=>_activateTabIdx(i);
     c.appendChild(d);
   });
 }
@@ -5337,9 +5933,11 @@ function renderHosts(list,limit){
   });
   return s+"</table>";
 }
+function _empty(label,hint){return`<div class="empty-state"><div class="label">${esc(label)}</div><div class="hint">${esc(hint||"")}</div></div>`}
+function _loading(label){return`<div class="loading-state"><div class="label"><span class="spinner"></span>${esc(label)}</div></div>`}
 function renderProto(expanded){
   const p=D.protocols||[];
-  if(!p.length)return`<div style="color:var(--dim)">(waiting for tshark...)</div>`;
+  if(!p.length)return _empty("No protocol data yet","Waiting for tshark to start capturing — check the TSHARK service indicator.");
   const max=p[0]?.count||1;
   let s=`<table><tr><th style="width:200px">Protocol</th><th style="width:100px">Count</th><th>Distribution</th></tr>`;
   p.forEach(x=>{
@@ -5350,23 +5948,34 @@ function renderProto(expanded){
 }
 function renderDNS(limit){
   const d=(D.dns||[]).slice(-(limit||50)).reverse();
-  if(!d.length)return`<div style="color:var(--dim)">(waiting...)</div>`;
+  if(!d.length)return _empty("No DNS queries yet","Run nslookup or wait for traffic with DNS lookups.");
   let s=`<table><tr><th style="width:80px">Time</th><th style="width:140px">IP</th><th>Domain</th></tr>`;
   d.forEach(e=>{s+=`<tr><td style="color:var(--dim)">${esc(e.time)}</td><td class="ip"><span class="ip-click" data-ip="${esc(e.ip)}">${esc(e.ip)}</span></td><td style="color:var(--magenta)">${esc(e.domain)}</td></tr>`});
   return s+"</table>";
 }
 function renderHP(limit){
-  const h=(D.honeypot||[]).slice(-(limit||50)).reverse();
-  if(!h.length)return`<div style="color:var(--dim)">(waiting for visitors...)</div>`;
+  // HTTP events live in the Scan tab (they're high-volume scanner noise that drowns out
+  // credential/telnet/ftp/rtsp signal). Mirrors the TUI's _section_honeypot(show_http=False) default.
+  const h=(D.honeypot||[]).filter(e=>e.service!=="http").slice(-(limit||50)).reverse();
+  if(!h.length)return _empty("No honeypot hits yet","Honeypots are listening on :21 / :23 / :80 / :554 — waiting for attackers.");
   let s=`<table><tr><th style="width:70px">Time</th><th style="width:100px">Service</th><th style="width:130px">IP</th><th>Summary</th></tr>`;
   h.forEach(e=>{s+=`<tr><td style="color:var(--dim)">${esc(e.time)}</td><td class="${hpClass(e.service)}">${esc(e.service)}</td><td class="ip"><span class="ip-click" data-ip="${esc(e.ip)}">${esc(e.ip)}</span></td><td>${esc(e.summary)}</td></tr>`});
+  return s+"</table>";
+}
+function renderScan(limit){
+  // HTTP probes split out from the honeypot tab — Mirai/CVE scanners hammer :80 constantly,
+  // so this view is its own signal class (path coverage, user agents, scanner identification).
+  const h=(D.honeypot||[]).filter(e=>e.service==="http").slice(-(limit||100)).reverse();
+  if(!h.length)return _empty("No HTTP probes yet","HTTP scan/probe traffic appears here once attackers hit :80.");
+  let s=`<table><tr><th style="width:70px">Time</th><th style="width:130px">IP</th><th>Probe</th></tr>`;
+  h.forEach(e=>{s+=`<tr><td style="color:var(--dim)">${esc(e.time)}</td><td class="ip"><span class="ip-click" data-ip="${esc(e.ip)}">${esc(e.ip)}</span></td><td>${esc(e.summary)}</td></tr>`});
   return s+"</table>";
 }
 function renderNmap(){
   const n=D.nmap||[];
   const status=D.nmap_running?`<span style="color:var(--yellow);animation:pulse 1s infinite">SCANNING...</span>`:`<span style="color:var(--dim)">idle</span>`;
   let s=`<div class="section-title">NMAP ${status} <span class="count">(${n.length} results)</span></div>`;
-  if(!n.length)return s+`<div style="color:var(--dim);padding:8px">(no scans yet) Type: <span style="color:var(--green)">scan &lt;ip&gt;</span></div>`;
+  if(!n.length)return s+_empty("No scans yet","Type 'scan <ip>' or 'deep <ip>' in the command bar.");
   const ips=new Set();
   n.forEach(r=>{const m=r.line.match(/(\d+\.\d+\.\d+\.\d+)/);if(m)ips.add(m[1])});
   if(ips.size){
@@ -5384,14 +5993,14 @@ function renderNmap(){
 }
 function renderARP(){
   const a=D.arp||[];
-  if(!a.length)return`<div style="color:var(--dim)">(no ARP entries yet)</div>`;
+  if(!a.length)return _empty("No ARP entries yet","ARP monitor watches your subnet — devices appear as they speak on the wire.");
   let s=`<table><tr><th style="width:180px">MAC</th><th style="width:140px">IP</th><th>State</th></tr>`;
   a.forEach(e=>{s+=`<tr class="clickable" onclick="showHostDetail('${esc(e.ip)}')"><td style="color:var(--cyan)">${esc(e.mac)}</td><td class="ip"><span class="ip-click" data-ip="${esc(e.ip)}">${esc(e.ip)}</span></td><td style="color:var(--dim)">${esc(e.state)}</td></tr>`});
   return s+"</table>";
 }
 function renderAlerts(){
   const a=(D.alerts||[]).slice(-50).reverse();
-  if(!a.length)return`<div style="color:var(--dim)">(no alerts)</div>`;
+  if(!a.length)return _empty("All quiet","No threat alerts yet. Alerts appear here when scoring fires or honeypots see credentials.");
   let s=`<table><tr><th style="width:70px">Time</th><th>Alert</th></tr>`;
   a.forEach(e=>{
     const m=e.msg.match(/(\d+\.\d+\.\d+\.\d+)/);
@@ -5402,7 +6011,7 @@ function renderAlerts(){
 }
 function renderOSINT(){
   const o=(D.osint||[]).slice(-50).reverse();
-  if(!o.length)return`<div style="color:var(--dim)">(no results yet) Run a scan, geo, whois, or recon command to see results here.</div>`;
+  if(!o.length)return _empty("No OSINT results yet","Run geo, whois, abuse, ssl, recon, etc. — results show here as they finish.");
   let s=`<table><tr><th style="width:70px">Time</th><th style="width:60px">Type</th><th style="width:160px">Target</th><th>Result</th><th style="width:60px">Detail</th></tr>`;
   o.forEach(r=>{
     const cls={"GEO":"osint-geo","DNS":"osint-dns","SCAN":"osint-scan","ABUSE":"osint-abuse","WHOIS":"osint-whois","CRT":"osint-dns","SSL":"osint-geo","PING":"osint-scan","SECHDR":"osint-abuse","TECH":"osint-whois"}[r.type]||"";
@@ -5418,8 +6027,93 @@ function renderProxy(){
   else{s+=`<div style="color:var(--dim);margin-bottom:12px">Proxy not active. Use <span style="color:var(--green)">proxy add socks5 127.0.0.1:9050</span> to configure.</div>`}
   return s;
 }
+let _replayCache=null,_replayCacheAt=0,_replayProto="ftp",_replayFilter="";
+function renderReplay(){
+  let s=`<div class="section-title">SESSION REPLAY
+    <span class="count" id="replay-count">(loading...)</span>
+    <span style="margin-left:auto;display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+      <input id="replay-filter" placeholder="filter ip / id..." value="${esc(_replayFilter)}"
+        style="background:var(--bg);border:1px solid var(--border);color:var(--fg);font:inherit;font-size:11px;padding:3px 8px;border-radius:3px;width:160px;outline:none">
+      <button onclick="_replayRefresh(true)" aria-label="Refresh sessions" title="Refresh"
+        style="background:var(--surface);color:var(--fg);border:1px solid var(--border);padding:3px 10px;border-radius:3px;cursor:pointer;font:inherit;font-size:11px">&#x21bb; Refresh</button>
+    </span>
+  </div>`;
+  s+=`<div id="replay-body">${_loading("Loading captured sessions...")}</div>`;
+  // schedule render after innerHTML flush
+  setTimeout(_replayMount,0);
+  return s;
+}
+function _replayMount(){
+  const inp=document.getElementById("replay-filter");
+  if(inp){
+    inp.oninput=()=>{_replayFilter=inp.value.trim().toLowerCase();_replayPaint()};
+    inp.focus();const v=inp.value;inp.value="";inp.value=v;
+  }
+  _replayRefresh(false);
+}
+async function _replayRefresh(force){
+  const fresh=force||!_replayCache||(Date.now()-_replayCacheAt>15000);
+  if(fresh){
+    try{
+      const r=await fetch("/api/replay");
+      _replayCache=await r.json();_replayCacheAt=Date.now();
+    }catch(e){_replayCache=[]}
+  }
+  _replayPaint();
+}
+function _replayPaint(){
+  const body=document.getElementById("replay-body");
+  const cnt=document.getElementById("replay-count");
+  if(!body)return;
+  const all=Array.isArray(_replayCache)?_replayCache:[];
+  const f=_replayFilter;
+  const rows=f?all.filter(s=>(s.session_id||"").toLowerCase().includes(f)||(s.ip||"").toLowerCase().includes(f)):all;
+  if(cnt)cnt.textContent=`(${rows.length}${f?` / ${all.length}`:""} sessions)`;
+  if(!rows.length){
+    body.innerHTML=f?_empty("No sessions match the filter","Clear the filter to see all captured sessions.")
+      :_empty("No replay sessions yet","Captured FTP/Telnet sessions land in logs/ — wait for honeypot hits or sync the droplet captures.");
+    return;
+  }
+  let h=`<table class="fade-in"><tr>
+    <th style="width:90px">When</th><th style="width:60px">Proto</th><th style="width:140px">IP</th>
+    <th>Session ID</th><th style="width:80px;text-align:right">Size</th><th style="width:90px">Action</th></tr>`;
+  rows.slice(0,200).forEach(s=>{
+    const when=_fmtAgo(s.started_at_mtime);
+    const protoCls=s.protocol==="telnet"?"hp-telnet":"hp-ftp";
+    h+=`<tr><td style="color:var(--muted)">${esc(when)}</td>`+
+       `<td><span class="${protoCls}" style="font-weight:600;text-transform:uppercase">${esc(s.protocol||"?")}</span></td>`+
+       `<td class="ip"><span class="ip-click" data-ip="${esc(s.ip||"")}">${esc(s.ip||"")}</span></td>`+
+       `<td style="color:var(--fg);font-size:11px">${esc(s.session_id)}</td>`+
+       `<td style="text-align:right;color:var(--muted)">${(s.event_count||0).toLocaleString()}</td>`+
+       `<td><button onclick="showReplayDetail('${esc(s.session_id)}','${esc(s.protocol||"ftp")}')" `+
+       `aria-label="Replay session ${esc(s.session_id)}" `+
+       `style="background:var(--accent);color:var(--bg);border:none;padding:3px 10px;border-radius:3px;cursor:pointer;font:inherit;font-size:11px;font-weight:600">&#9658; Play</button></td></tr>`;
+  });
+  h+=`</table>`;
+  if(rows.length>200)h+=`<div style="color:var(--muted);font-size:11px;padding:8px 0">Showing 200 of ${rows.length}. Use the filter to narrow.</div>`;
+  body.innerHTML=h;
+}
+function _fmtAgo(iso){
+  if(!iso)return"—";
+  const t=new Date(iso).getTime();
+  if(!t)return iso;
+  const s=Math.max(0,Math.floor((Date.now()-t)/1000));
+  if(s<60)return s+"s ago";
+  if(s<3600)return Math.floor(s/60)+"m ago";
+  if(s<86400)return Math.floor(s/3600)+"h ago";
+  return Math.floor(s/86400)+"d ago";
+}
+function showReplayDetail(sid,proto){
+  const p=$("#detail-panel"),b=$("#detail-body"),t=$("#detail-title");
+  t.textContent=`Replay: ${sid} (${proto.toUpperCase()})`;
+  b.innerHTML=`<iframe src="/replay/${encodeURIComponent(sid)}?proto=${encodeURIComponent(proto)}" `+
+    `title="Session replay player for ${esc(sid)}" `+
+    `style="width:100%;height:70vh;border:1px solid var(--border);border-radius:4px;background:var(--bg)"></iframe>`;
+  p.classList.add("open");
+}
+
 function renderMesh(){
-  if(!D.mesh_connected)return`<div style="color:var(--dim)">Meshtastic not connected. Connect a LoRa radio via USB.</div>`;
+  if(!D.mesh_connected)return _empty("Meshtastic not connected","Plug a LoRa radio (T-Beam / Heltec) over USB and restart NetWatch.");
   let s=`<div style="color:var(--green);font-weight:700;margin-bottom:8px">MESH RADIO CONNECTED</div>`;
   s+=`<div style="margin-bottom:12px;color:var(--dim)">Nodes: ${D.mesh_nodes||0} | Messages: ${D.mesh_msgs||0} | Alert forwarding: ${D.mesh_alert_fwd?"ON":"OFF"}</div>`;
   s+=`<div style="margin-bottom:8px"><input id="mesh-input" type="text" placeholder="Send mesh message..." style="background:var(--bg);border:1px solid var(--border);color:var(--text);font-family:inherit;font-size:12px;padding:6px 10px;border-radius:4px;width:60%;outline:none"><button onclick="sendMesh()" style="background:var(--green);color:var(--bg);border:none;padding:6px 14px;margin-left:6px;border-radius:4px;cursor:pointer;font-family:inherit;font-weight:700">SEND</button></div>`;
@@ -5508,6 +6202,23 @@ function renderHelp(){
 }
 
 let _charts={};
+function _css(n){return getComputedStyle(document.body).getPropertyValue(n).trim()||"#c8ccd4"}
+function _rgba(hex,a){
+  const h=hex.replace("#","");
+  if(h.length!==3&&h.length!==6)return hex;
+  const v=h.length===3?h.split("").map(c=>c+c).join(""):h;
+  const r=parseInt(v.slice(0,2),16),g=parseInt(v.slice(2,4),16),b=parseInt(v.slice(4,6),16);
+  return`rgba(${r},${g},${b},${a})`;
+}
+function _chartPalette(){
+  return{
+    fg:_css("--fg"),muted:_css("--muted"),accent:_css("--accent"),
+    info:_css("--info"),good:_css("--good"),warn:_css("--warn"),
+    magenta:_css("--magenta"),blue:_css("--blue"),
+    threatHigh:_css("--threat-high"),threatMed:_css("--threat-med"),threatLow:_css("--threat-low"),
+    grid:_rgba(_css("--fg")||"#fff",.05),gridSubtle:_rgba(_css("--fg")||"#fff",.03)
+  };
+}
 function initCharts(){
   if(typeof Chart==="undefined")return;
   if(_charts.traffic)return;
@@ -5515,23 +6226,27 @@ function initCharts(){
   const ctx2=document.getElementById("chart-proto");
   const ctx3=document.getElementById("chart-threat");
   if(!ctx1||!ctx2||!ctx3)return;
+  const p=_chartPalette();
   const cfg={responsive:true,maintainAspectRatio:false,animation:{duration:300},
-    plugins:{legend:{labels:{color:"#c8ccd4",font:{size:10}}}}};
+    plugins:{legend:{labels:{color:p.fg,font:{size:10}}}}};
   _charts.traffic=new Chart(ctx1,{type:"line",data:{labels:[],datasets:[
-    {label:"Packets",data:[],borderColor:"#00d4ff",backgroundColor:"rgba(0,212,255,.1)",fill:true,tension:.3,pointRadius:0},
-    {label:"Bytes (KB)",data:[],borderColor:"#ff3333",backgroundColor:"rgba(255,51,51,.1)",fill:true,tension:.3,pointRadius:0,yAxisID:"y1"}
-  ]},options:{...cfg,scales:{x:{ticks:{color:"#555",maxTicksLimit:8},grid:{color:"rgba(255,255,255,.03)"}},
-    y:{ticks:{color:"#00d4ff"},grid:{color:"rgba(255,255,255,.05)"}},
-    y1:{position:"right",ticks:{color:"#ff3333"},grid:{drawOnChartArea:false}}}}});
+    {label:"Packets",data:[],borderColor:p.info,backgroundColor:_rgba(p.info,.1),fill:true,tension:.3,pointRadius:0},
+    {label:"Bytes (KB)",data:[],borderColor:p.accent,backgroundColor:_rgba(p.accent,.1),fill:true,tension:.3,pointRadius:0,yAxisID:"y1"}
+  ]},options:{...cfg,scales:{x:{ticks:{color:p.muted,maxTicksLimit:8},grid:{color:p.gridSubtle}},
+    y:{ticks:{color:p.info},grid:{color:p.grid}},
+    y1:{position:"right",ticks:{color:p.accent},grid:{drawOnChartArea:false}}}}});
   _charts.proto=new Chart(ctx2,{type:"doughnut",data:{labels:[],datasets:[{data:[],
-    backgroundColor:["#00d4ff","#ff3333","#00ff88","#ffcc00","#ff66ff","#4488ff","#ff8844","#88ff44","#44ffcc","#cc44ff"]}]},
-    options:{...cfg,plugins:{...cfg.plugins,legend:{position:"right",labels:{color:"#c8ccd4",font:{size:10},padding:8}}}}});
+    backgroundColor:[p.info,p.accent,p.good,p.warn,p.magenta,p.blue,p.threatMed,p.threatLow,p.fg,p.muted]}]},
+    options:{...cfg,plugins:{...cfg.plugins,legend:{position:"right",labels:{color:p.fg,font:{size:10},padding:8}}}}});
   _charts.threat=new Chart(ctx3,{type:"bar",data:{labels:["Clean","Low","Medium","High"],datasets:[{data:[0,0,0,0],
-    backgroundColor:["#0a2a15","#2a2a0a","#2a1a0a","#2a0a0a"],
-    borderColor:["#00ff88","#ffcc00","#ff8844","#ff3333"],borderWidth:1}]},
+    backgroundColor:[_rgba(p.good,.15),_rgba(p.warn,.15),_rgba(p.threatMed,.18),_rgba(p.threatHigh,.2)],
+    borderColor:[p.good,p.warn,p.threatMed,p.threatHigh],borderWidth:1}]},
     options:{...cfg,plugins:{...cfg.plugins,legend:{display:false}},
-    scales:{x:{ticks:{color:"#555"},grid:{color:"rgba(255,255,255,.03)"}},
-    y:{ticks:{color:"#555"},grid:{color:"rgba(255,255,255,.05)"}}}}});
+    scales:{x:{ticks:{color:p.muted},grid:{color:p.gridSubtle}},
+    y:{ticks:{color:p.muted},grid:{color:p.grid}}}}});
+}
+function _destroyCharts(){
+  ["traffic","proto","threat"].forEach(k=>{if(_charts[k]){_charts[k].destroy();delete _charts[k]}});
 }
 
 let _tsData=[];
@@ -5576,7 +6291,7 @@ function render(){
     html+=renderProto();
     html+=`<div class="section-title">DNS <span class="count">(${(D.dns||[]).length})</span></div>`;
     html+=renderDNS(5);
-    html+=`<div class="section-title">HONEYPOT <span class="count">(${(D.honeypot||[]).length})</span></div>`;
+    html+=`<div class="section-title">HONEYPOT <span class="count">(${(D.honeypot||[]).filter(e=>e.service!=="http").length})</span></div>`;
     html+=renderHP(5);
     if((D.alerts||[]).length){html+=`<div class="section-title" style="color:var(--red)">ALERTS <span class="count">(${D.alerts.length})</span></div>`;html+=renderAlerts()}
   }else{cr.style.display="none"}
@@ -5592,6 +6307,9 @@ function render(){
   }else if(tab==="honeypot"){
     html+=`<div class="section-title">HONEYPOT EVENTS</div>`;
     html+=renderHP();
+  }else if(tab==="scan"){
+    html+=`<div class="section-title">SCAN PROBES <span class="count">(${(D.honeypot||[]).filter(e=>e.service==="http").length})</span></div>`;
+    html+=renderScan();
   }else if(tab==="nmap"){
     html+=renderNmap();
   }else if(tab==="arp"){
@@ -5609,6 +6327,8 @@ function render(){
   }else if(tab==="mesh"){
     html+=`<div class="section-title">MESH RADIO</div>`;
     html+=renderMesh();
+  }else if(tab==="replay"){
+    html+=renderReplay();
   }else if(tab==="help"){
     html+=renderHelp();
   }
@@ -5631,16 +6351,38 @@ function updateHeader(){
 
 let evtSrc,_tsCounter=0;
 let _lastCounts="",_renderPending=false;
+let _sseBackoff=1000,_sseExpired=false;
+function _sseStatus(state){
+  const dot=document.querySelector("#header .pulse");
+  if(!dot)return;
+  if(state==="ok"){dot.style.background="var(--good)";dot.title="Live updates streaming"}
+  else if(state==="retry"){dot.style.background="var(--warn)";dot.title="Reconnecting..."}
+  else if(state==="expired"){dot.style.background="var(--threat-high)";dot.title="Session expired"}
+}
+function _showAuthExpired(){
+  if(_sseExpired)return;
+  _sseExpired=true;
+  const wrap=document.createElement("div");
+  wrap.id="auth-expired";
+  wrap.setAttribute("role","alertdialog");
+  wrap.style.cssText="position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.75);z-index:1200;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(2px)";
+  wrap.innerHTML=`<div style="background:var(--surface);border:1px solid var(--threat-high);border-radius:8px;padding:22px 28px;max-width:90vw;width:380px;text-align:center">
+    <div style="color:var(--threat-high);font-weight:700;font-size:14px;margin-bottom:10px">SESSION EXPIRED</div>
+    <div style="color:var(--fg);font-size:12px;margin-bottom:14px;line-height:1.5">Your auth cookie is no longer valid (token rotation or restart).<br>Reload and paste the current token.</div>
+    <button onclick="location.reload()" style="background:var(--accent);color:var(--bg);border:none;padding:8px 22px;border-radius:4px;cursor:pointer;font:inherit;font-weight:600">Reload</button>
+  </div>`;
+  document.body.appendChild(wrap);
+}
 function connect(){
-  evtSrc=new EventSource("/api/stream");
+  if(_sseExpired)return;
+  try{evtSrc=new EventSource("/api/stream")}catch(e){console.warn("SSE construct failed:",e);return}
+  evtSrc.onopen=()=>{_sseBackoff=1000;_sseStatus("ok")};
   evtSrc.onmessage=e=>{
     try{
-      const prev=D;
       D=JSON.parse(e.data);
       updateHeader();
-      // Only re-render content when data actually changes
       const counts=`${D.host_count}|${(D.dns||[]).length}|${(D.honeypot||[]).length}|${(D.nmap||[]).length}|${(D.alerts||[]).length}|${(D.osint||[]).length}|${(D.arp||[]).length}|${D.nmap_running}|${tab}`;
-      if(counts!==_lastCounts){
+      if(counts!==_lastCounts&&tab!=="replay"){
         _lastCounts=counts;
         if(!_renderPending){
           _renderPending=true;
@@ -5653,11 +6395,23 @@ function connect(){
           });
         }
       }
-      // Update charts in-place without re-render
       if(tab==="all"&&_charts.traffic){updateCharts();_tsCounter++;if(_tsCounter%10===0)loadTimeseries()}
-    }catch(err){}
+    }catch(err){console.warn("SSE parse error:",err)}
   };
-  evtSrc.onerror=()=>{evtSrc.close();setTimeout(connect,3000)};
+  evtSrc.onerror=()=>{
+    if(evtSrc){evtSrc.close();evtSrc=null}
+    // Probe / to detect 401 vs simple disconnect — if 401, prompt re-auth.
+    fetch("/api/state",{credentials:"same-origin"}).then(r=>{
+      if(r.status===401){_showAuthExpired();_sseStatus("expired");return}
+      _sseStatus("retry");
+      setTimeout(connect,_sseBackoff);
+      _sseBackoff=Math.min(_sseBackoff*2,30000);
+    }).catch(()=>{
+      _sseStatus("retry");
+      setTimeout(connect,_sseBackoff);
+      _sseBackoff=Math.min(_sseBackoff*2,30000);
+    });
+  };
 }
 
 async function sendMesh(){
@@ -5877,7 +6631,44 @@ document.addEventListener("click",e=>{
 });
 
 $("#output-close").onclick=()=>{$("#output-panel").classList.remove("open");$("#output-panel").style.height=""};
-$("#detail-close").onclick=()=>$("#detail-panel").classList.remove("open");
+$("#detail-close").onclick=()=>{$("#detail-panel").classList.remove("open");if(_lastFocus)try{_lastFocus.focus()}catch(e){}};
+
+// Focus trap for detail-panel (modal dialog)
+let _lastFocus=null;
+function _focusable(el){
+  return Array.from(el.querySelectorAll('a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),iframe,[tabindex]:not([tabindex="-1"])'));
+}
+document.addEventListener("keydown",e=>{
+  const dp=$("#detail-panel");
+  if(!dp.classList.contains("open")||e.key!=="Tab")return;
+  const items=_focusable(dp);
+  if(!items.length)return;
+  const first=items[0],last=items[items.length-1];
+  if(e.shiftKey&&document.activeElement===first){last.focus();e.preventDefault()}
+  else if(!e.shiftKey&&document.activeElement===last){first.focus();e.preventDefault()}
+});
+// Remember last focus when opening modal, restore on close
+const _origShowDetail=showHostDetail;
+showHostDetail=async function(ip){
+  _lastFocus=document.activeElement;
+  await _origShowDetail(ip);
+  const dp=$("#detail-panel"),first=_focusable(dp)[0];
+  if(first)first.focus();
+};
+const _origShowScan=showScanDetail;
+showScanDetail=async function(ip){
+  _lastFocus=document.activeElement;
+  await _origShowScan(ip);
+  const dp=$("#detail-panel"),first=_focusable(dp)[0];
+  if(first)first.focus();
+};
+const _origShowReplay=showReplayDetail;
+showReplayDetail=function(sid,proto){
+  _lastFocus=document.activeElement;
+  _origShowReplay(sid,proto);
+  const dp=$("#detail-panel"),first=_focusable(dp)[0];
+  if(first)first.focus();
+};
 
 $("#cmd-input").addEventListener("keydown",async e=>{
   if(e.key!=="Enter")return;
@@ -5887,17 +6678,34 @@ $("#cmd-input").addEventListener("keydown",async e=>{
   runCmd(cmd);
 });
 
+function _activateTabIdx(i){
+  if(i<0||i>=TABS.length)return;
+  tab=TABS[i];
+  $$(".tab").forEach((t,j)=>{t.classList.toggle("active",j===i);if(j===i)t.setAttribute("aria-selected","true");else t.setAttribute("aria-selected","false")});
+  render();
+}
+function _tabIdx(name){return TABS.indexOf(name)}
 document.addEventListener("keydown",e=>{
   if(document.activeElement===$("#cmd-input"))return;
   if(e.key==="Escape"){
+    if($("#kbd-help").classList.contains("open")){$("#kbd-help").classList.remove("open");return}
     if($("#detail-panel").classList.contains("open")){$("#detail-panel").classList.remove("open");return}
     $("#ctx-menu").style.display="none";
     if($("#output-panel").classList.contains("open")){$("#output-panel").classList.remove("open");$("#output-panel").style.height="";return}
     return;
   }
+  if(e.key==="?"||(e.key==="/"&&e.shiftKey)){
+    e.preventDefault();$("#kbd-help").classList.toggle("open");return;
+  }
+  if(e.shiftKey){
+    if(e.key==="M"||e.key==="m"){const i=_tabIdx("mesh");if(i>=0){e.preventDefault();_activateTabIdx(i);return}}
+    if(e.key==="H"||e.key==="h"){const i=_tabIdx("help");if(i>=0){e.preventDefault();_activateTabIdx(i);return}}
+    return;
+  }
+  if(e.key==="r"||e.key==="R"){const i=_tabIdx("replay");if(i>=0){e.preventDefault();_activateTabIdx(i);return}}
   const n=parseInt(e.key);
-  if(n>=1&&n<=9&&n<=TABS.length){tab=TABS[n-1];$$(".tab").forEach((t,i)=>{t.classList.toggle("active",i===n-1)});render();return}
-  if(e.key==="0"&&TABS.length>=10){tab=TABS[9];$$(".tab").forEach((t,i)=>{t.classList.toggle("active",i===9)});render();return}
+  if(n>=1&&n<=9&&n<=TABS.length){_activateTabIdx(n-1);return}
+  if(e.key==="0"&&TABS.length>=10){_activateTabIdx(9);return}
   if(e.key==="/"){e.preventDefault();$("#cmd-input").focus()}
 });
 
@@ -5907,10 +6715,17 @@ _themeSel.value=localStorage.getItem("nw_theme")||"";
 document.body.className=_themeSel.value;
 _scanSel.value=localStorage.getItem("nw_scanline")||"";
 _scanOverlay.className=_scanSel.value;
-_themeSel.onchange=()=>{document.body.className=_themeSel.value;localStorage.setItem("nw_theme",_themeSel.value)};
+_themeSel.onchange=()=>{
+  document.body.className=_themeSel.value;
+  localStorage.setItem("nw_theme",_themeSel.value);
+  _destroyCharts();
+  if(tab==="all"){initCharts();updateCharts();loadTimeseries()}
+};
 _scanSel.onchange=()=>{_scanOverlay.className=_scanSel.value;localStorage.setItem("nw_scanline",_scanSel.value)};
 
 initTabs();
+$("#kbd-help-btn").onclick=()=>$("#kbd-help").classList.toggle("open");
+$("#kbd-help").onclick=e=>{if(e.target.id==="kbd-help")$("#kbd-help").classList.remove("open")};
 connect();
 fetch("/api/state").then(r=>r.json()).then(d=>{D=d;updateHeader();render()}).catch(()=>{});
 </script>
@@ -5985,6 +6800,310 @@ def web_scan_log(ip):
     except Exception:
         pass
     return jsonify({"ip": ip, "scans": results})
+
+# -- SESSION REPLAY (uses replay.py data layer)
+
+@web_app.route("/replay")
+def web_replay_index():
+    return render_template_string(_REPLAY_INDEX_HTML)
+
+def _replay_proto_arg():
+    p = (request.args.get("proto") or "ftp").lower()
+    return p if p in ("ftp", "telnet") else "ftp"
+
+@web_app.route("/replay/<session_id>")
+def web_replay_player(session_id):
+    if not replay.SESSION_ID_RE.match(session_id):
+        return jsonify({"error": "invalid session_id"}), 400
+    return render_template_string(_REPLAY_PLAYER_HTML,
+                                  session_id=session_id,
+                                  protocol=_replay_proto_arg())
+
+def _replay_extra_dirs():
+    """Extra capture dirs to merge into replay listings (e.g. droplet rsync).
+
+    Order: official $NETWATCH_EXTRA_LOG_DIRS (colon-separated), then a couple
+    of conventional defaults. Each entry is silently skipped if missing.
+    """
+    env = os.environ.get("NETWATCH_EXTRA_LOG_DIRS", "")
+    dirs = [d.strip() for d in env.split(":") if d.strip()]
+    dirs += [
+        os.path.expanduser("~/agents/honeypot-captures"),
+        "/home/mrrobot/agents/honeypot-captures",
+    ]
+    seen = set()
+    out = []
+    for d in dirs:
+        rp = os.path.realpath(d) if d else ""
+        if rp and rp not in seen and os.path.isdir(rp):
+            seen.add(rp)
+            out.append(rp)
+    return out
+
+@web_app.route("/api/replay")
+def web_replay_api_index():
+    merged = list(replay.replay_index())
+    seen = {s.get("session_id") for s in merged}
+    for d in _replay_extra_dirs():
+        try:
+            for s in replay.replay_index(log_dir=d):
+                sid = s.get("session_id")
+                if sid and sid not in seen:
+                    seen.add(sid)
+                    s["source"] = "droplet"
+                    merged.append(s)
+        except Exception:
+            continue
+    merged.sort(key=lambda s: s.get("started_at_mtime", ""), reverse=True)
+    return jsonify(merged)
+
+@web_app.route("/api/replay/<session_id>")
+def web_replay_api_session(session_id):
+    if not replay.SESSION_ID_RE.match(session_id):
+        return jsonify({"error": "invalid session_id"}), 400
+    proto = _replay_proto_arg()
+    last_err = None
+    for log_dir in [None] + _replay_extra_dirs():
+        try:
+            timeline = replay.replay_loader(session_id, protocol=proto, log_dir=log_dir)
+            timeline["intel"] = replay.load_intel(timeline["ip"], log_dir=log_dir)
+            return jsonify(timeline)
+        except FileNotFoundError as e:
+            last_err = e
+            continue
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+    return jsonify({"error": "session not found"}), 404
+
+_REPLAY_INDEX_HTML = r"""<!DOCTYPE html><html><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NetWatch · Replay sessions</title>
+<style>
+ body{background:#0a0e0a;color:#cfe;font:13px/1.4 ui-monospace,Menlo,Consolas,monospace;margin:0;padding:24px}
+ h1{color:#7df58a;font-weight:400;letter-spacing:1px;margin:0 0 4px}
+ .sub{color:#5a8;margin-bottom:24px;font-size:11px}
+ a{color:#7df58a;text-decoration:none}
+ a:hover{color:#fff;background:#143}
+ table{width:100%;border-collapse:collapse;margin-top:8px}
+ th{text-align:left;padding:6px 10px;color:#5a8;font-weight:400;border-bottom:1px solid #143;font-size:11px;text-transform:uppercase;letter-spacing:1px}
+ td{padding:6px 10px;border-bottom:1px solid #0f1a10}
+ tr:hover td{background:#0e1810}
+ .empty{padding:40px;text-align:center;color:#588}
+ .nav{margin-bottom:16px}
+ .nav a{padding:4px 10px;border:1px solid #2a4;border-radius:3px;margin-right:8px}
+ .ip{color:#fff}
+ .num{color:#999;text-align:right}
+ .proto{font-size:10px;padding:1px 6px;border-radius:2px;text-transform:uppercase;letter-spacing:1px}
+ .proto.ftp{background:#143;color:#7df58a}
+ .proto.telnet{background:#311;color:#f87}
+</style></head><body>
+<div class="nav"><a href="/">← dashboard</a><a href="/replay" id="refresh">↻ refresh</a></div>
+<h1>SESSION REPLAY</h1>
+<div class="sub">Captured honeypot sessions — click any session to scrub the timeline</div>
+<div id="content"><div class="empty">loading…</div></div>
+<script>
+const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+async function load(){
+  let sessions;
+  try{
+    const r=await fetch('/api/replay');
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    sessions=await r.json();
+  }catch(e){
+    document.getElementById('content').innerHTML=`<div class="empty">Failed to load sessions: ${esc(e.message||e)}</div>`;return;
+  }
+  const el=document.getElementById('content');
+  if(!sessions.length){el.innerHTML='<div class="empty">No sessions captured yet — once attackers hit a honeypot, they\'ll appear here.</div>';return}
+  let h='<table><thead><tr><th>session id</th><th>proto</th><th>attacker ip</th><th>captured</th><th>events</th></tr></thead><tbody>';
+  for(const s of sessions){
+    const ts=String(s.started_at_mtime||'').replace('T',' ').replace(/\..*/,'');
+    const proto=(s.protocol==='telnet')?'telnet':'ftp';  // whitelist
+    const sid=encodeURIComponent(s.session_id);
+    h+=`<tr><td><a href="/replay/${sid}?proto=${proto}">${esc(s.session_id)}</a></td>`+
+       `<td><span class="proto ${proto}">${proto}</span></td>`+
+       `<td class="ip">${esc(s.ip)}</td><td>${esc(ts)} UTC</td><td class="num">${Number(s.event_count)||0}</td></tr>`;
+  }
+  el.innerHTML=h+'</tbody></table>';
+}
+load();
+document.getElementById('refresh').addEventListener('click',e=>{e.preventDefault();load()});
+</script>
+</body></html>"""
+
+_REPLAY_PLAYER_HTML = r"""<!DOCTYPE html><html><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NetWatch · Replay {{ session_id }}</title>
+<style>
+ body{background:#0a0e0a;color:#cfe;font:13px/1.4 ui-monospace,Menlo,Consolas,monospace;margin:0}
+ header{padding:14px 20px;border-bottom:1px solid #143;display:flex;align-items:center;gap:20px;flex-wrap:wrap}
+ header h1{color:#7df58a;font:400 14px/1 inherit;letter-spacing:2px;margin:0}
+ header .meta{color:#5a8;font-size:11px}
+ header .meta b{color:#fff;font-weight:400}
+ header a{color:#7df58a;text-decoration:none;padding:3px 8px;border:1px solid #2a4;border-radius:3px;font-size:11px}
+ main{display:grid;grid-template-columns:1fr 280px;height:calc(100vh - 130px)}
+ #events{overflow-y:auto;padding:12px 18px}
+ .ev{padding:3px 0;display:grid;grid-template-columns:70px 80px 1fr;gap:10px;border-radius:2px}
+ .ev .t{color:#588;font-size:11px}
+ .ev .k{font-size:11px;text-transform:uppercase;letter-spacing:1px}
+ .ev[data-k=server] .k{color:#7df58a}
+ .ev[data-k=server_fail] .k{color:#f55}
+ .ev[data-k=client] .k{color:#fc7}
+ .ev[data-k=cred] .k{color:#f9f}
+ .ev[data-k=upload] .k,.ev[data-k=upload_saved] .k,.ev[data-k=data_recv] .k{color:#9cf}
+ .ev[data-k=download] .k,.ev[data-k=data_send] .k{color:#9cf}
+ .ev[data-k=session_end] .k,.ev[data-k=quit] .k{color:#666}
+ .ev .x{color:#cfe;word-break:break-all;white-space:pre-wrap}
+ .ev.future{opacity:.18}
+ .ev.cursor{background:#143}
+ #intel{border-left:1px solid #143;padding:14px 16px;overflow-y:auto;background:#070b07}
+ #intel h2{color:#5a8;font:400 11px/1 inherit;letter-spacing:2px;text-transform:uppercase;margin:0 0 12px}
+ #intel dt{color:#588;font-size:11px;margin-top:10px;text-transform:uppercase;letter-spacing:1px}
+ #intel dd{color:#fff;margin:2px 0 0}
+ #intel .empty{color:#588;font-style:italic;font-size:11px}
+ footer{border-top:1px solid #143;padding:10px 18px;display:flex;align-items:center;gap:14px;background:#070b07}
+ footer button{background:#0a0e0a;color:#7df58a;border:1px solid #2a4;padding:4px 12px;border-radius:3px;cursor:pointer;font:inherit}
+ footer button:hover{background:#143;color:#fff}
+ footer button.active{background:#143;color:#fff}
+ #scrub{flex:1;height:6px;-webkit-appearance:none;background:#143;border-radius:3px;outline:none}
+ #scrub::-webkit-slider-thumb{-webkit-appearance:none;width:14px;height:14px;background:#7df58a;border-radius:50%;cursor:pointer}
+ #scrub::-moz-range-thumb{width:14px;height:14px;background:#7df58a;border-radius:50%;border:none;cursor:pointer}
+ #time{color:#fff;font-variant-numeric:tabular-nums;min-width:120px;text-align:right}
+ .err{color:#f55;padding:40px;text-align:center}
+</style></head><body>
+<header>
+ <h1>NETWATCH · REPLAY</h1>
+ <div class="meta">session <b id="sid">{{ session_id }}</b></div>
+ <div class="meta">ip <b id="ip">…</b></div>
+ <div class="meta">duration <b id="dur">…</b></div>
+ <a href="/replay">← all sessions</a>
+</header>
+<main>
+ <div id="events"><div class="err">loading…</div></div>
+ <div id="intel"><h2>ATTACKER INTEL</h2><div id="intelBody"><div class="empty">loading…</div></div></div>
+</main>
+<footer>
+ <button id="home" title="jump to start (Home)">⏮</button>
+ <button id="back10" title="-10s (&lt;)">⏪</button>
+ <button id="back1" title="-1s (←)">◀</button>
+ <button id="play">▶</button>
+ <button id="fwd1" title="+1s (→)">▶|</button>
+ <button id="fwd10" title="+10s (&gt;)">⏩</button>
+ <button id="end" title="jump to end (End)">⏭</button>
+ <button data-speed="0.5">0.5×</button>
+ <button data-speed="1" class="active">1×</button>
+ <button data-speed="2">2×</button>
+ <button data-speed="4">4×</button>
+ <input type="range" id="scrub" min="0" max="0" value="0" step="1">
+ <span id="time">00:00 / 00:00</span>
+</footer>
+<script>
+const sid={{ session_id|tojson }};
+const proto={{ protocol|tojson }};
+const SPEEDS=[0.25,0.5,1,2,4,8];
+let timeline=null,cursor=0,playing=false,speed=1,timer=null,lastTick=0;
+const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function fmt(ms){const s=Math.floor(ms/1000),m=Math.floor(s/60);return `${String(m).padStart(2,'0')}:${String(s%60).padStart(2,'0')}`}
+function renderIntel(intel){
+ const b=document.getElementById('intelBody');
+ if(!intel||!intel.ip){b.innerHTML='<div class="empty">No OSINT recon yet for this IP. Run <code>recon</code> from the dashboard.</div>';return}
+ const rows=[['IP',intel.ip],['Country',intel.country],['City',intel.city],['ASN',intel.asn],['Org',intel.org],['Abuse',intel.abuse_score],['Hostname',intel.hostname]];
+ let h='<dl>';
+ for(const [k,v] of rows)if(v||v===0)h+=`<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`;
+ if(intel.tags&&intel.tags.length)h+=`<dt>Tags</dt><dd>${esc(intel.tags.join(', '))}</dd>`;
+ if(intel.notes)h+=`<dt>Notes</dt><dd>${esc(intel.notes)}</dd>`;
+ b.innerHTML=h+'</dl>';
+}
+function renderEvents(){
+ const el=document.getElementById('events');
+ if(!timeline.events.length){el.innerHTML='<div class="err">No events captured in this session (banner-only).</div>';return}
+ let h='',lastCursorIdx=-1;
+ for(let i=0;i<timeline.events.length;i++){
+  const e=timeline.events[i],fut=e.t_ms>cursor;
+  if(!fut)lastCursorIdx=i;
+  h+=`<div class="ev${fut?' future':''}" data-k="${esc(e.kind)}" data-i="${i}"><span class="t">${fmt(e.t_ms)}</span><span class="k">${esc(e.kind)}</span><span class="x">${esc(e.text)}</span></div>`;
+ }
+ el.innerHTML=h;
+ const cur=el.querySelector(`[data-i="${lastCursorIdx}"]`);
+ if(cur){cur.classList.add('cursor');cur.scrollIntoView({block:'nearest'})}
+}
+function updateScrubber(){
+ document.getElementById('scrub').value=cursor;
+ document.getElementById('time').textContent=`${fmt(cursor)} / ${fmt(timeline.duration_ms)}`;
+}
+function setCursor(ms){
+ cursor=Math.max(0,Math.min(timeline.duration_ms,ms|0));
+ lastTick=performance.now();
+ updateScrubber();renderEvents();
+}
+function setSpeed(v){
+ speed=v;lastTick=performance.now();
+ document.querySelectorAll('[data-speed]').forEach(x=>x.classList.toggle('active',parseFloat(x.dataset.speed)===v));
+}
+function stepSpeed(dir){
+ const i=SPEEDS.indexOf(speed);
+ const ni=Math.max(0,Math.min(SPEEDS.length-1,(i<0?2:i)+dir));
+ setSpeed(SPEEDS[ni]);
+}
+function play(){
+ if(!playing && cursor>=timeline.duration_ms) cursor=0;  // restart from end
+ playing=!playing;
+ document.getElementById('play').textContent=playing?'❚❚':'▶';
+ lastTick=performance.now();
+ if(playing&&!timer)tick();
+}
+function tick(){
+ if(!playing){timer=null;return}
+ const now=performance.now(),dt=(now-lastTick)*speed;lastTick=now;
+ cursor=Math.min(timeline.duration_ms,cursor+dt);
+ updateScrubber();renderEvents();
+ if(cursor>=timeline.duration_ms){playing=false;document.getElementById('play').textContent='▶';timer=null;return}
+ timer=requestAnimationFrame(tick);
+}
+async function load(){
+ try{
+  const r=await fetch(`/api/replay/${encodeURIComponent(sid)}?proto=${proto}`);
+  if(!r.ok){document.getElementById('events').innerHTML=`<div class="err">${esc((await r.json()).error||'load failed')}</div>`;return}
+  timeline=await r.json();
+  document.getElementById('ip').textContent=timeline.ip;
+  document.getElementById('dur').textContent=fmt(timeline.duration_ms);
+  document.getElementById('scrub').max=Math.max(timeline.duration_ms,1);
+  // Auto-slow sub-2-second captures so playback is actually visible
+  // (many FTP probes are sub-100ms TLS handshakes that would flash past).
+  if(timeline.duration_ms>0 && timeline.duration_ms<2000){
+    setSpeed(0.25);
+    document.getElementById('dur').title='Auto-slowed to 0.25× — session is under 2s';
+  }
+  renderIntel(timeline.intel);renderEvents();updateScrubber();
+ }catch(e){document.getElementById('events').innerHTML=`<div class="err">${esc(e)}</div>`}
+}
+document.getElementById('play').addEventListener('click',play);
+document.getElementById('back1').addEventListener('click',()=>setCursor(cursor-1000));
+document.getElementById('fwd1').addEventListener('click',()=>setCursor(cursor+1000));
+document.getElementById('back10').addEventListener('click',()=>setCursor(cursor-10000));
+document.getElementById('fwd10').addEventListener('click',()=>setCursor(cursor+10000));
+document.getElementById('home').addEventListener('click',()=>setCursor(0));
+document.getElementById('end').addEventListener('click',()=>setCursor(timeline?timeline.duration_ms:0));
+document.getElementById('scrub').addEventListener('input',e=>setCursor(parseInt(e.target.value,10)));
+document.querySelectorAll('[data-speed]').forEach(b=>b.addEventListener('click',()=>setSpeed(parseFloat(b.dataset.speed))));
+document.addEventListener('keydown',e=>{
+ if(!timeline)return;
+ const tag=(e.target.tagName||'').toLowerCase();
+ if(tag==='input'||tag==='textarea')return;
+ switch(e.key){
+  case ' ':e.preventDefault();play();break;
+  case 'ArrowLeft':e.preventDefault();setCursor(cursor-1000);break;
+  case 'ArrowRight':e.preventDefault();setCursor(cursor+1000);break;
+  case '<':case ',':e.preventDefault();setCursor(cursor-10000);break;
+  case '>':case '.':e.preventDefault();setCursor(cursor+10000);break;
+  case 'Home':e.preventDefault();setCursor(0);break;
+  case 'End':e.preventDefault();setCursor(timeline.duration_ms);break;
+  case '+':case '=':e.preventDefault();stepSpeed(1);break;
+  case '-':case '_':e.preventDefault();stepSpeed(-1);break;
+ }
+});
+load();
+</script>
+</body></html>"""
 
 # -- TIME-SERIES SAMPLING
 
@@ -6319,9 +7438,9 @@ def main():
     print("  ║   Honeypot + Traffic + tshark + nmap        ║")
     print(f"  ╚════════════════════════════════════════════╝{RESET}")
     print(f"  {GREEN}Honeypot HTTP   : :8080{RESET}")
-    print(f"  {GREEN}Honeypot Telnet : :2323{RESET}")
-    print(f"  {GREEN}Honeypot FTP    : :2121  (bait files + keystroke log){RESET}")
-    print(f"  {GREEN}Honeypot RTSP   : :8554{RESET}")
+    print(f"  {GREEN}Honeypot Telnet : :{TELNET_PORT}{RESET}")
+    print(f"  {GREEN}Honeypot FTP    : :{FTP_PORT}  (bait files + keystroke log){RESET}")
+    print(f"  {GREEN}Honeypot RTSP   : :{RTSP_PORT}{RESET}")
     print(f"  {GREEN}Traffic Sniffer : {IFACE}{RESET}")
     print(f"  {GREEN}tshark Protocol : {IFACE}{RESET}")
     print(f"  {GREEN}tcpdump Capture : {PCAP_DIR}/{RESET}")
@@ -6379,17 +7498,19 @@ def main():
             except Exception:
                 pass
         save_logs()
-        subprocess.run(["fuser", "-k", "2323/tcp", "8554/tcp", "8080/tcp",
-                        "2121/tcp", "9090/tcp"], capture_output=True)
+        subprocess.run(["fuser", "-k",
+                        f"{TELNET_PORT}/tcp", f"{RTSP_PORT}/tcp",
+                        f"{HTTP_PORT}/tcp", f"{FTP_PORT}/tcp",
+                        f"{WEB_PORT}/tcp"], capture_output=True)
         sys.exit(0)
 
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
     # Start all modules
-    threading.Thread(target=telnet_honeypot, args=(2323,), daemon=True).start()
-    threading.Thread(target=rtsp_honeypot, args=(8554,), daemon=True).start()
-    threading.Thread(target=ftp_honeypot, args=(2121,), daemon=True).start()
+    threading.Thread(target=telnet_honeypot, args=(TELNET_PORT,), daemon=True).start()
+    threading.Thread(target=rtsp_honeypot, args=(RTSP_PORT,), daemon=True).start()
+    threading.Thread(target=ftp_honeypot, args=(FTP_PORT,), daemon=True).start()
     if HAS_RAW_NET:
         threading.Thread(target=traffic_monitor, daemon=True).start()
         threading.Thread(target=tshark_monitor, daemon=True).start()
@@ -6406,7 +7527,7 @@ def main():
 
     # Flask honeypot in background thread (so main thread can do console)
     flask_thread = threading.Thread(
-        target=lambda: app.run(host="0.0.0.0", port=8080, debug=False, use_reloader=False),
+        target=lambda: app.run(host="0.0.0.0", port=HTTP_PORT, debug=False, use_reloader=False),
         daemon=True
     )
     flask_thread.start()
@@ -6468,8 +7589,11 @@ def main():
             seq = b""
             while select.select([fd], [], [], 0.05)[0]:
                 seq += os.read(fd, 1)
+            if seq == b"": return "esc"
             if seq == b"[A": return "up"
             if seq == b"[B": return "down"
+            if seq == b"[C": return "right"
+            if seq == b"[D": return "left"
             if seq == b"[5~": return "pgup"
             if seq == b"[6~": return "pgdn"
             if seq in (b"[H", b"[1~"): return "home"
@@ -6608,6 +7732,55 @@ def main():
                 app_state.switch(SCREEN_CLI); _redraw_event.set(); continue
             if key == "f3":
                 app_state.switch(SCREEN_CONSOLE); _redraw_event.set(); continue
+
+            # Replay screen owns its own bindings (space/arrows/</>/+-/home/end/q).
+            if app_state.current_screen == SCREEN_REPLAY:
+                tl = app_state.replay_timeline
+                dur = int((tl or {}).get("duration_ms") or 0)
+                if key == "q" or key == "esc":
+                    app_state.replay_playing = False
+                    app_state.switch(app_state.last_screen or SCREEN_DASHBOARD)
+                    _redraw_event.set(); continue
+                if key == " ":
+                    if dur > 0:
+                        if app_state.replay_cursor_ms >= dur:
+                            app_state.replay_cursor_ms = 0
+                        app_state.replay_playing = not app_state.replay_playing
+                        app_state.replay_last_tick = time.monotonic()
+                    _redraw_event.set(); continue
+                if key == "left":
+                    app_state.replay_cursor_ms = max(0, app_state.replay_cursor_ms - 1000)
+                    _redraw_event.set(); continue
+                if key == "right":
+                    app_state.replay_cursor_ms = min(dur, app_state.replay_cursor_ms + 1000)
+                    _redraw_event.set(); continue
+                if key == "<" or key == ",":
+                    app_state.replay_cursor_ms = max(0, app_state.replay_cursor_ms - 10000)
+                    _redraw_event.set(); continue
+                if key == ">" or key == ".":
+                    app_state.replay_cursor_ms = min(dur, app_state.replay_cursor_ms + 10000)
+                    _redraw_event.set(); continue
+                if key == "home":
+                    app_state.replay_cursor_ms = 0
+                    _redraw_event.set(); continue
+                if key == "end":
+                    app_state.replay_cursor_ms = dur
+                    app_state.replay_playing = False
+                    _redraw_event.set(); continue
+                if key in ("+", "="):
+                    try:
+                        i = _REPLAY_SPEED_STEPS.index(app_state.replay_speed)
+                    except ValueError:
+                        i = 2
+                    app_state.replay_speed = _REPLAY_SPEED_STEPS[min(i + 1, len(_REPLAY_SPEED_STEPS) - 1)]
+                    _redraw_event.set(); continue
+                if key in ("-", "_"):
+                    try:
+                        i = _REPLAY_SPEED_STEPS.index(app_state.replay_speed)
+                    except ValueError:
+                        i = 2
+                    app_state.replay_speed = _REPLAY_SPEED_STEPS[max(i - 1, 0)]
+                    _redraw_event.set(); continue
 
             # Scroll keys target the active screen's buffer.
             _scr = app_state.current_screen

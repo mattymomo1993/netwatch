@@ -5,7 +5,7 @@
 [![PyPI version](https://img.shields.io/pypi/v/netwatch-sec.svg)](https://pypi.org/project/netwatch-sec/)
 [![Downloads](https://static.pepy.tech/badge/netwatch-sec)](https://pepy.tech/project/netwatch-sec)
 [![Downloads/month](https://static.pepy.tech/badge/netwatch-sec/month)](https://pepy.tech/project/netwatch-sec)
-[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![Flask](https://img.shields.io/badge/Flask-2.3+-000000?logo=flask&logoColor=white)](https://flask.palletsprojects.com/)
 [![Raspberry Pi](https://img.shields.io/badge/Raspberry%20Pi-A22846?logo=raspberrypi&logoColor=white)](https://www.raspberrypi.org/)
@@ -13,7 +13,8 @@
 [![Parrot OS](https://img.shields.io/badge/Parrot%20OS-15CDCA?logo=parrotsecurity&logoColor=white)](https://www.parrotsec.org/)
 [![Kali](https://img.shields.io/badge/Kali-557C94?logo=kalilinux&logoColor=white)](https://www.kali.org/)
 [![Platform: Debian](https://img.shields.io/badge/platform-debian-A81D33?logo=debian&logoColor=white)](https://www.debian.org/)
-[![Tests](https://img.shields.io/badge/tests-1900-brightgreen.svg)](tests/)
+[![Tests](https://img.shields.io/badge/tests-2094-brightgreen.svg)](tests/)
+[![Version](https://img.shields.io/badge/version-1.2.0-blue.svg)](CHANGELOG.md)
 [![Status: Active](https://img.shields.io/badge/status-active-brightgreen.svg)]()
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-FFDD00?logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/pr0xy_22)
 
@@ -125,6 +126,63 @@ From the TUI prompt:
 |---------|--------|
 | `rotate-key` | Generate a new Fernet key — invalidates all active web sessions. Persisted to `~/.config/netwatch/web.key`. |
 | `rotate-token` | Generate a new auth token — invalidates all sessions. Re-written to `~/.config/netwatch/token` (0600). |
+
+### Honeypot ports
+
+Defaults bind to high ports so root isn't required: HTTP `:8080`, Telnet `:2323`, FTP `:2121`, RTSP `:8554`. Override via env to move to standard ports (needs `CAP_NET_BIND_SERVICE` or root):
+
+```bash
+NETWATCH_HTTP_PORT=80 \
+NETWATCH_TELNET_PORT=23 \
+NETWATCH_FTP_PORT=21 \
+NETWATCH_RTSP_PORT=554 \
+sudo -E netwatch
+```
+
+Persist by adding to `/etc/netwatch.env` and referencing in the systemd unit's `EnvironmentFile=`. Internet-facing scanners hit the standard ports — non-standard ports stay invisible to most drive-by traffic.
+
+### Replay tunables
+
+Same-IP telnet attempts roll up into one aggregated session (`all_<ip>`) so a scanner banging your honeypot all day shows as one entry instead of fifty. Inside the timeline, `── ATTEMPT N (timestamp UTC) ──` markers separate bursts. Tune the burst threshold with:
+
+```bash
+NETWATCH_TELNET_GAP_SEC=86400 sudo -E netwatch   # one marker per day (default: 300 = 5 min)
+```
+
+Individual per-attempt sessions remain loadable via their original `<ip>_HHMMSS` id for drill-down.
+
+### CrowdSec auto-ban (optional)
+
+If [`cscli`](https://docs.crowdsec.net/) is installed on the host, every honeypot capture (`credential`, `telnet`, `ftp`, `rtsp`, `malware_attempt`, `ftp_upload`, `telnet_cmd`) automatically calls `cscli decisions add` with a 4h ban. The CrowdSec firewall bouncer enforces the drop via ipset, so the rule count never blows up. Same-IP events within 60s are deduped. Set `NETWATCH_AUTODEFEND=0` to disable. With no CrowdSec installed, the hook silently no-ops.
+
+Install on Debian:
+
+```bash
+curl -s https://install.crowdsec.net | sudo sh
+sudo apt install -y crowdsec crowdsec-firewall-bouncer-iptables
+sudo systemctl enable --now crowdsec crowdsec-firewall-bouncer
+```
+
+Whitelist your operator IP so you don't ban yourself — add `/etc/crowdsec/parsers/s02-enrich/whitelists.yaml`:
+
+```yaml
+name: netwatch/operator-whitelist
+whitelist:
+  reason: "operator home"
+  ip: ["<your-public-ip>"]
+```
+
+## Session Replay
+
+```bash
+sudo netwatch                                          # capture starts immediately
+python tools/synth_ftp_session.py 198.51.100.42        # optional — fake an attacker
+# open http://localhost:9090 and click the REPLAY tab
+```
+
+Every captured session (FTP, Telnet, HTTP probes) is recorded as a scrubbable timeline. The web player auto-lists sessions; pick one and step through the keystrokes frame by frame. In the TUI, `replay list` shows recent sessions and `replay <idx>` drops into the player.
+
+Player keys: `space` play/pause · `←/→` step · `</>` jump session · `+/-` speed · `Home/End` ends. Full architecture in [`docs/DROP4_TUI_REPLAY_PLAN.md`](docs/DROP4_TUI_REPLAY_PLAN.md).
 
 ## Remote Access
 
@@ -323,6 +381,16 @@ mesh send <text>     mesh status     mesh nodes     mesh alert on/off
 
 All events logged to JSON with ANSI-stripped, sanitized data. Connection limits per service (50 max). FTP has path traversal protection and filename sanitization.
 
+### Session replay → GIF
+
+Turn any FTP session log into a watchable asciinema cast and GIF:
+
+```bash
+python3 tools/replay_to_gif.py logs/ftp_session_<ip>_<ts>.log demo.gif
+```
+
+Real attacker cadence preserved, idle stalls compressed. Requires [`agg`](https://github.com/asciinema/agg) for the GIF step.
+
 ## GraphQL API
 
 Available at `:9090/graphql` when `graphene` is installed.
@@ -391,6 +459,8 @@ sudo ln -s $(pwd)/netwatch-start.sh /usr/local/bin/netwatch
 sudo cp netwatch.service /etc/systemd/system/
 sudo systemctl enable --now netwatch
 ```
+
+<a href="https://www.digitalocean.com/?refcode=acc36004569d&utm_campaign=Referral_Invite&utm_medium=Referral_Program&utm_source=badge"><img src="https://web-platforms.sfo2.cdn.digitaloceanspaces.com/WWW/Badge%203.svg" alt="DigitalOcean Referral Badge" /></a>
 
 ## Headless Mode
 

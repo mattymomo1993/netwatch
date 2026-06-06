@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "netwatch-sec"
-version = "1.1.0"
+version = "1.2.0"
 description = "All-in-one network security dashboard: honeypots, traffic capture, OSINT, scanning, mesh alerts."
 readme = "README.md"
 requires-python = ">=3.9"

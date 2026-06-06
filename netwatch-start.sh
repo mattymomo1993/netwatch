@@ -9,8 +9,19 @@ FIXED_TOKEN="${NETWATCH_FIXED_TOKEN:-}"
 # Skip iface arg if it's a flag
 [[ "$1" == --* ]] && IFACE="wlan0"
 
-if [ "$EUID" -ne 0 ]; then
-    exec sudo "$0" "$@"
+# Termux (Android) has no sudo and no root — run in passive mode directly.
+# Detection mirrors netwatch.py: TERMUX_VERSION env var OR Termux PREFIX path.
+IS_TERMUX=0
+if [ -n "${TERMUX_VERSION:-}" ] || [[ "${PREFIX:-}" == /data/data/com.termux* ]]; then
+    IS_TERMUX=1
+fi
+
+if [ "$EUID" -ne 0 ] && [ "$IS_TERMUX" -ne 1 ]; then
+    if command -v sudo >/dev/null 2>&1; then
+        exec sudo -E "$0" "$@"
+    else
+        echo "[!] Not root and sudo not available — running in passive mode (honeypots + web only)." >&2
+    fi
 fi
 
 # Token: random by default, fixed with --fixed-token
