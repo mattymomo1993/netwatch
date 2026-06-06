@@ -5,7 +5,7 @@
 [![PyPI version](https://img.shields.io/pypi/v/netwatch-sec.svg)](https://pypi.org/project/netwatch-sec/)
 [![Downloads](https://static.pepy.tech/badge/netwatch-sec)](https://pepy.tech/project/netwatch-sec)
 [![Downloads/month](https://static.pepy.tech/badge/netwatch-sec/month)](https://pepy.tech/project/netwatch-sec)
-[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![Flask](https://img.shields.io/badge/Flask-2.3+-000000?logo=flask&logoColor=white)](https://flask.palletsprojects.com/)
 [![Raspberry Pi](https://img.shields.io/badge/Raspberry%20Pi-A22846?logo=raspberrypi&logoColor=white)](https://www.raspberrypi.org/)
@@ -13,7 +13,8 @@
 [![Parrot OS](https://img.shields.io/badge/Parrot%20OS-15CDCA?logo=parrotsecurity&logoColor=white)](https://www.parrotsec.org/)
 [![Kali](https://img.shields.io/badge/Kali-557C94?logo=kalilinux&logoColor=white)](https://www.kali.org/)
 [![Platform: Debian](https://img.shields.io/badge/platform-debian-A81D33?logo=debian&logoColor=white)](https://www.debian.org/)
-[![Tests](https://img.shields.io/badge/tests-1900-brightgreen.svg)](tests/)
+[![Tests](https://img.shields.io/badge/tests-2046-brightgreen.svg)](tests/)
+[![Version](https://img.shields.io/badge/version-1.2.0-blue.svg)](CHANGELOG.md)
 [![Status: Active](https://img.shields.io/badge/status-active-brightgreen.svg)]()
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-FFDD00?logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/pr0xy_22)
 

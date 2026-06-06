@@ -22,10 +22,14 @@ from datetime import datetime, timezone
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(_BASE_DIR, "logs")
 
-# IPv4 dotted, IPv6 colon-hex, plus _HHMMSS suffix from ftp_log,
-# with optional _microseconds appended (FTP per-connect uniqueness).
+# Accepts two forms:
+#   <ip>_HHMMSS[_microsec]  — per-connect session (FTP + per-attempt telnet)
+#   all_<ip>                — aggregated telnet rollup (every attempt from this IP)
 # \A / \Z (not ^ / $) — Python's $ allows a trailing newline; we don't.
-SESSION_ID_RE = re.compile(r"\A[0-9a-fA-F.:]+_[0-9]{6}(?:_[0-9]+)?\Z")
+SESSION_ID_RE = re.compile(
+    r"\A(?:all_[0-9a-fA-F.:]+|[0-9a-fA-F.:]+_[0-9]{6}(?:_[0-9]+)?)\Z"
+)
+_TELNET_AGG_PREFIX = "all_"
 
 # Strips trailing _HHMMSS (+ optional _microsec) from a session_id to recover the IP.
 _SESSION_TIME_SUFFIX_RE = re.compile(r"_[0-9]{6}(?:_[0-9]+)?\Z")
@@ -151,7 +155,18 @@ def _load_ftp_session(session_id, log_dir):
 
 # Telnet sessions don't have per-session log files — they're synthesized from
 # `all_events.json` by grouping events from the same IP within a time gap.
-TELNET_SESSION_GAP_SEC = 300  # 5 min between events = new session
+# Default 5 min; override at runtime with NETWATCH_TELNET_GAP_SEC to collapse
+# longer campaigns into fewer "── ATTEMPT N ──" markers (e.g. 86400 = one
+# marker per day). Read lazily so env changes take effect without re-import.
+TELNET_SESSION_GAP_SEC = 300  # historical default; the live value is _telnet_gap_sec().
+
+
+def _telnet_gap_sec():
+    try:
+        v = int(os.environ.get("NETWATCH_TELNET_GAP_SEC", str(TELNET_SESSION_GAP_SEC)))
+        return max(1, v)
+    except ValueError:
+        return TELNET_SESSION_GAP_SEC
 _TELNET_SERVICES = {"telnet", "telnet_cmd", "malware_attempt"}
 
 
@@ -232,7 +247,56 @@ def _flush_telnet_bucket(sessions, ip, first_ms, bucket):
     sessions[sid] = {"ip": ip, "first_ms": first_ms, "raw": bucket}
 
 
+def _group_telnet_by_ip(log_dir):
+    """Roll up every telnet event from each IP into one synthetic session.
+
+    Visible "── ATTEMPT N (yyyy-mm-dd HH:MM:SS UTC) ──" connect markers separate
+    bursts (same gap rule as _group_telnet_sessions). Returns:
+        dict: ip -> {"ip", "first_ms", "raw": [(ms, kind, text)], "attempts": int}
+    """
+    by_ip = {}
+    for ts, ip, service, data in _iter_telnet_events(log_dir):
+        try:
+            dt = datetime.fromisoformat(ts)
+        except ValueError:
+            continue
+        ms = int(dt.timestamp() * 1000)
+        kind, text = _format_telnet_event(service, data)
+        by_ip.setdefault(ip, []).append((ms, kind, text))
+
+    out = {}
+    for ip, events in by_ip.items():
+        events.sort(key=lambda x: x[0])
+        merged = []
+        attempt_num = 0
+        prev_ms = None
+        for ms, kind, text in events:
+            if prev_ms is None or (ms - prev_ms) > TELNET_SESSION_GAP_SEC * 1000:
+                attempt_num += 1
+                label = datetime.fromtimestamp(
+                    ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                merged.append((ms, "connect", f"── ATTEMPT {attempt_num} ({label}) ──"))
+            merged.append((ms, kind, text))
+            prev_ms = ms
+        if merged:
+            out[ip] = {
+                "ip": ip,
+                "first_ms": events[0][0],
+                "raw": merged,
+                "attempts": attempt_num,
+            }
+    return out
+
+
 def _load_telnet_session(session_id, log_dir):
+    # all_<ip> form replays every attempt from one IP, marker-separated.
+    if session_id.startswith(_TELNET_AGG_PREFIX):
+        ip = session_id[len(_TELNET_AGG_PREFIX):]
+        by_ip = _group_telnet_by_ip(log_dir)
+        s = by_ip.get(ip)
+        if s is None:
+            raise FileNotFoundError(f"no telnet session: {session_id}")
+        return s["ip"], s["raw"]
     sessions = _group_telnet_sessions(log_dir)
     s = sessions.get(session_id)
     if s is None:
@@ -318,15 +382,17 @@ def replay_index(log_dir=None):
             "event_count": st.st_size,
         })
 
-    # Telnet — synthesized from all_events.json
-    for sid, info in _group_telnet_sessions(log_dir).items():
+    # Telnet — one row per IP with all attempts rolled up. Per-attempt session_ids
+    # (e.g. "1.2.3.4_120000") still load via _load_telnet_session for drill-down.
+    for ip, info in _group_telnet_by_ip(log_dir).items():
         out.append({
-            "session_id": sid,
-            "ip": info["ip"],
+            "session_id": f"{_TELNET_AGG_PREFIX}{ip}",
+            "ip": ip,
             "protocol": "telnet",
             "started_at_mtime": datetime.fromtimestamp(
                 info["first_ms"] / 1000, tz=timezone.utc).isoformat(),
             "event_count": len(info["raw"]),
+            "attempts": info["attempts"],
         })
 
     out.sort(key=lambda r: r["started_at_mtime"], reverse=True)

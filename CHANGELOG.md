@@ -6,6 +6,7 @@ All notable changes to NetWatch are documented here. Format follows [Keep a Chan
 
 ### Added
 - Session replay viewer (web + TUI) — scrubbable playback of captured attacker sessions.
+- Same-IP telnet sessions roll up into one aggregated entry (`all_<ip>`) with visible `── ATTEMPT N ──` separator events; per-attempt drill-down still works via the original session_id.
 - CrowdSec auto-ban integration — local `cscli` bridge, ipset-backed enforcement, 60s same-IP dedupe.
 - Scan tab — HTTP probe events split off the honeypot tab so signal density stays high.
 - Port configuration via env vars: `NETWATCH_HTTP_PORT`, `NETWATCH_TELNET_PORT`, `NETWATCH_FTP_PORT`, `NETWATCH_RTSP_PORT`.

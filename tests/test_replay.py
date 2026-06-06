@@ -292,7 +292,7 @@ def _telnet_event(ts_iso, ip, service="telnet", **data):
 
 class TestTelnetSessionGrouping:
     def test_groups_bursts_into_one_session(self, tmp_path):
-        # 5 login attempts from one IP within 30s → 1 session
+        # 5 login attempts from one IP within 30s → 1 aggregated session.
         events = [
             _telnet_event(f"2026-06-02T02:47:{10+i:02d}+00:00",
                           "110.37.66.188", username=u, password="")
@@ -303,10 +303,14 @@ class TestTelnetSessionGrouping:
         telnet = [r for r in idx if r["protocol"] == "telnet"]
         assert len(telnet) == 1
         assert telnet[0]["ip"] == "110.37.66.188"
-        assert telnet[0]["event_count"] == 5
+        assert telnet[0]["session_id"] == "all_110.37.66.188"
+        assert telnet[0]["attempts"] == 1
+        # 5 telnet events + 1 attempt marker = 6
+        assert telnet[0]["event_count"] == 6
 
-    def test_gap_creates_separate_sessions(self, tmp_path):
-        # Same IP, two bursts separated by > 5 min → 2 sessions
+    def test_gap_groups_multi_attempts_into_one_aggregated_row(self, tmp_path):
+        # Same IP, two bursts separated by > 5 min → 1 aggregated row (attempts=2).
+        # Per-attempt drill-down stays accessible via the individual session_ids.
         events = [
             _telnet_event("2026-06-02T02:47:10+00:00", "1.2.3.4", username="root"),
             _telnet_event("2026-06-02T02:47:15+00:00", "1.2.3.4", username="admin"),
@@ -316,7 +320,14 @@ class TestTelnetSessionGrouping:
         _write_all_events(tmp_path, events)
         idx = replay.replay_index(log_dir=str(tmp_path))
         telnet = [r for r in idx if r["protocol"] == "telnet"]
-        assert len(telnet) == 2
+        assert len(telnet) == 1
+        assert telnet[0]["session_id"] == "all_1.2.3.4"
+        assert telnet[0]["attempts"] == 2
+        # Individual attempts still loadable via the per-burst format.
+        tl = replay.replay_loader("1.2.3.4_024710", protocol="telnet",
+                                  log_dir=str(tmp_path))
+        assert tl["ip"] == "1.2.3.4"
+        assert len(tl["events"]) == 2
 
     def test_different_ips_get_different_sessions(self, tmp_path):
         events = [
@@ -330,6 +341,56 @@ class TestTelnetSessionGrouping:
         assert len(telnet) == 2
         assert telnet[0]["ip"] == "1.2.3.4"
         assert telnet[1]["ip"] == "5.6.7.8"
+
+
+class TestTelnetAggregatedLoader:
+    """all_<ip> form rolls up every attempt with visible separator markers."""
+
+    def test_aggregated_load_includes_all_attempts(self, tmp_path):
+        events = [
+            _telnet_event("2026-06-02T02:47:10+00:00", "9.9.9.9", username="root"),
+            _telnet_event("2026-06-02T02:47:12+00:00", "9.9.9.9", username="admin"),
+            _telnet_event("2026-06-02T03:00:00+00:00", "9.9.9.9", username="guest"),
+        ]
+        _write_all_events(tmp_path, events)
+        tl = replay.replay_loader("all_9.9.9.9", protocol="telnet",
+                                  log_dir=str(tmp_path))
+        assert tl["ip"] == "9.9.9.9"
+        # 3 telnet events + 2 attempt markers (one per burst).
+        kinds = [e["kind"] for e in tl["events"]]
+        assert kinds.count("connect") == 2
+        # Total events: 3 telnet + 2 markers.
+        assert len(tl["events"]) == 5
+
+    def test_aggregated_load_unknown_ip_raises(self, tmp_path):
+        _write_all_events(tmp_path, [])
+        with pytest.raises(FileNotFoundError):
+            replay.replay_loader("all_198.51.100.42", protocol="telnet",
+                                 log_dir=str(tmp_path))
+
+    def test_aggregated_session_id_validates(self):
+        # Valid: all_<ipv4>
+        replay._validate_session_id("all_1.2.3.4")
+        # Valid: all_<ipv6 hex>
+        replay._validate_session_id("all_2001:db8::1")
+        # Invalid: empty IP after prefix
+        with pytest.raises(ValueError):
+            replay._validate_session_id("all_")
+        # Invalid: shell metacharacter
+        with pytest.raises(ValueError):
+            replay._validate_session_id("all_1.2.3.4;rm")
+
+    def test_attempt_marker_text_format(self, tmp_path):
+        events = [
+            _telnet_event("2026-06-02T02:47:10+00:00", "8.8.8.8", username="root"),
+        ]
+        _write_all_events(tmp_path, events)
+        tl = replay.replay_loader("all_8.8.8.8", protocol="telnet",
+                                  log_dir=str(tmp_path))
+        marker = next(e for e in tl["events"] if e["kind"] == "connect")
+        assert "ATTEMPT 1" in marker["text"]
+        assert "2026-06-02" in marker["text"]
+        assert "UTC" in marker["text"]
 
 
 class TestTelnetReplayLoader:
