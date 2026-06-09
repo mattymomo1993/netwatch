@@ -2,6 +2,16 @@
 
 All notable changes to NetWatch are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 1.2.1 — 2026-06-09
+
+### Fixed
+- `VERSION` constant bumped 1.1.0 → 1.2.1 (dashboard banner was reporting wrong version).
+- Hardcoded developer-machine paths replaced — caused install crash for fresh users:
+  - proxychains config now resolved via `BASE_DIR`, falls back to system default if missing
+  - `PROXYCHAIN_SCRIPT` now reads `NETWATCH_PROXYCHAIN_SCRIPT` env or `~/scripts/proxychain.sh`
+  - extra log-dir fallback now `~/agents/honeypot-captures` (expanded per user)
+  - cloudflared binary lookup: `shutil.which` → `NETWATCH_CLOUDFLARED_BIN` → `~/agents/agent-office/cloudflared`
+
 ## 1.2.0 — 2026-06-05
 
 ### Added

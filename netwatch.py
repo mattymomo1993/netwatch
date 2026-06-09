@@ -19,6 +19,7 @@ import sys
 import ssl
 import time
 import json
+import shutil
 import socket
 import select
 import struct
@@ -69,7 +70,7 @@ for _i, _a in enumerate(sys.argv):
     if _a == "--token" and _i + 1 < len(sys.argv):
         _cli_token = sys.argv[_i + 1]
         break
-VERSION = "1.1.0"
+VERSION = "1.2.1"
 
 # Honeypot listener ports — overridable via env so deployments can move to
 # standard ports (80/23/21/554) without local sed against the repo.
@@ -2470,10 +2471,14 @@ def stealth_scan(target):
         alerts.append({"time": datetime.now().strftime("%H:%M:%S"),
                        "msg": f"STEALTH SCAN: {target} (via Tor)..."})
     try:
+        # Repo-relative proxychains config — falls back to system default if missing.
+        _pcc = os.path.join(BASE_DIR, "proxychains-strict.conf")
+        _argv = ["proxychains4"]
+        if os.path.isfile(_pcc):
+            _argv += ["-f", _pcc]
+        _argv += ["nmap", "-sT", "-T3", "--top-ports", "100", "-oN", "-", target]
         result = subprocess.run(
-            ["proxychains4", "-f", "/home/mrrobot/agents/honeypot/proxychains-strict.conf",
-             "nmap", "-sT", "-T3", "--top-ports", "100", "-oN", "-", target],
-            capture_output=True, text=True, timeout=600
+            _argv, capture_output=True, text=True, timeout=600
         )
         ts = datetime.now().strftime("%H:%M:%S")
         with lock:
@@ -4216,7 +4221,10 @@ def _cmd_subnet_sweep(cidr):
     _osint_record("SWEEP", cidr, f"{len(alive)} hosts alive")
 
 
-PROXYCHAIN_SCRIPT = "/home/mrrobot/scripts/proxychain.sh"
+PROXYCHAIN_SCRIPT = os.environ.get(
+    "NETWATCH_PROXYCHAIN_SCRIPT",
+    os.path.expanduser("~/scripts/proxychain.sh"),
+)
 _TOR_SOCKS_PORTS = [9050, 9052, 9054]
 
 # ─── Multi-Proxy System ──────────────────────────────────
@@ -4283,6 +4291,12 @@ def _test_proxy(entry):
 
 def _cmd_proxy(sub):
     if sub == "start":
+        # Fail loud if the configured script is missing — avoids `sudo bash` on a
+        # non-existent or misconfigured NETWATCH_PROXYCHAIN_SCRIPT path.
+        if not os.path.isfile(PROXYCHAIN_SCRIPT):
+            add_console(f"  {RED}proxy: script not found: {PROXYCHAIN_SCRIPT}{RESET}")
+            add_console(f"  {DIM}Set NETWATCH_PROXYCHAIN_SCRIPT to an existing helper, or skip `proxy start`.{RESET}")
+            return
         add_console(f"{MAGENTA}Starting Tor circuits...{RESET}")
         try:
             r = subprocess.run(["sudo", "bash", PROXYCHAIN_SCRIPT, "start"],
@@ -4299,6 +4313,9 @@ def _cmd_proxy(sub):
             add_console(f"  {RED}Error: {e}{RESET}")
 
     elif sub == "stop":
+        if not os.path.isfile(PROXYCHAIN_SCRIPT):
+            add_console(f"  {RED}proxy: script not found: {PROXYCHAIN_SCRIPT}{RESET}")
+            return
         add_console(f"{MAGENTA}Stopping extra Tor circuits...{RESET}")
         try:
             r = subprocess.run(["sudo", "bash", PROXYCHAIN_SCRIPT, "stop"],
@@ -6827,10 +6844,7 @@ def _replay_extra_dirs():
     """
     env = os.environ.get("NETWATCH_EXTRA_LOG_DIRS", "")
     dirs = [d.strip() for d in env.split(":") if d.strip()]
-    dirs += [
-        os.path.expanduser("~/agents/honeypot-captures"),
-        "/home/mrrobot/agents/honeypot-captures",
-    ]
+    dirs += [os.path.expanduser("~/agents/honeypot-captures")]
     seen = set()
     out = []
     for d in dirs:
@@ -7556,9 +7570,14 @@ def main():
     if _HAS_GQL:
         print(f"  {GREEN}GraphQL IDE     : http://0.0.0.0:{WEB_PORT}/graphql{RESET}")
 
-    # Cloudflare tunnel for remote access
-    _cf_bin = "/home/mrrobot/agents/agent-office/cloudflared"
-    if os.path.isfile(_cf_bin):
+    # Cloudflare tunnel for remote access — prefer PATH, then env override,
+    # then common install locations. Missing → tunnel just not started.
+    _cf_bin = (
+        shutil.which("cloudflared")
+        or os.environ.get("NETWATCH_CLOUDFLARED_BIN")
+        or os.path.expanduser("~/agents/agent-office/cloudflared")
+    )
+    if _cf_bin and os.path.isfile(_cf_bin):
         try:
             _cf_proc = subprocess.Popen(
                 [_cf_bin, "tunnel", "--url", f"http://localhost:{WEB_PORT}"],
