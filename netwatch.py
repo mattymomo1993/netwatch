@@ -5433,6 +5433,17 @@ _ALLOWED_NETS = [
     ipaddress.ip_network("192.168.0.0/16"),
     ipaddress.ip_network("100.64.0.0/10"),  # tailscale
 ]
+# NETWATCH_WEB_ALLOW=cidr,cidr,... lets operators add their own home/office IPs
+# without forking. Loopback is still required from the cloudflared tunnel path,
+# so adding a public CIDR here is purely additive.
+for _extra in os.environ.get("NETWATCH_WEB_ALLOW", "").split(","):
+    _extra = _extra.strip()
+    if not _extra:
+        continue
+    try:
+        _ALLOWED_NETS.append(ipaddress.ip_network(_extra, strict=False))
+    except ValueError:
+        print(f"  {RED}NETWATCH_WEB_ALLOW: ignoring invalid CIDR {_extra!r}{RESET}")
 
 web_app = Flask("netwatch_web")
 web_app.secret_key = secrets.token_hex(32)

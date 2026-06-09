@@ -188,10 +188,35 @@ Player keys: `space` play/pause · `←/→` step · `</>` jump session · `+/-`
 
 When `cloudflared` is available, NetWatch starts a quick tunnel automatically at launch. The public `*.trycloudflare.com` URL is printed at startup and pinned to the top of the **all** tab on the dashboard so you can copy it without scrolling through alerts.
 
+Console commands (type into the prompt):
+
+| Command | Purpose |
+|---------|---------|
+| `tunnel` | Reprint the current trycloudflare URL + full web token |
+| `restart-tunnel` | Kill cloudflared, spawn a fresh tunnel (new URL) |
+| `token` | Reprint the full web token + on-disk path |
+
 ```bash
 # Manual fallback if cloudflared isn't on $PATH
 cloudflared tunnel --url http://localhost:9090
+
+# Or point NetWatch at a non-default cloudflared binary
+NETWATCH_CLOUDFLARED_BIN=/opt/cf/cloudflared sudo -E netwatch
 ```
+
+### Public-IP access (no tunnel)
+
+The web dashboard's IP allowlist defaults to **loopback + RFC1918 + Tailscale (100.64/10)** so a fresh install can't be reached from the open internet by accident. To allow your home/office IP, set `NETWATCH_WEB_ALLOW` to one or more CIDRs:
+
+```bash
+# Single host
+NETWATCH_WEB_ALLOW=203.0.113.42/32 sudo -E netwatch
+
+# Multiple ranges (comma-separated)
+NETWATCH_WEB_ALLOW="203.0.113.42/32,198.51.100.0/24" sudo -E netwatch
+```
+
+Invalid CIDRs are skipped with a warning at startup. Token auth still applies — adding an IP only lets the login page render. Pair with `ufw`/`iptables` for defense in depth.
 
 ## Termux / non-root (passive mode)
 
@@ -256,7 +281,7 @@ Browser UI on `:9090` with live SSE updates, 5 themes, and CRT scanline effects.
 
 - Token auth required (auto-generated or `--token <val>` or env var `NETWATCH_TOKEN`)
 - Fernet-encrypted session cookies, key persisted at `~/.config/netwatch/web.key`
-- Private network access only (127/10/192.168/100.64)
+- Private network access by default (127/10/192.168/100.64); add public CIDRs via `NETWATCH_WEB_ALLOW=cidr,cidr,...`
 - CSRF origin validation on all POST endpoints
 - Destructive commands disabled via web
 - SSRF protection on outbound OSINT (fails closed, private IP rejection)
