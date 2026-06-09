@@ -1,7 +1,7 @@
 #!/bin/bash
 # NetWatch launcher — just run: sudo netwatch
 #   --fixed-token : use persistent token instead of random
-NETWATCH="./honeypot/netwatch.py"
+NETWATCH="./netwatch.py"
 IFACE="${1:-wlan0}"
 # Set NETWATCH_FIXED_TOKEN in your environment (e.g., ~/.bashrc) — never commit it
 FIXED_TOKEN="${NETWATCH_FIXED_TOKEN:-}"
