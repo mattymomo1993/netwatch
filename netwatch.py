@@ -2571,6 +2571,7 @@ _cmd_history = deque(maxlen=_CMD_HISTORY_MAX)
 _output_scroll = 0
 _OUTPUT_PANEL_MIN = 6
 _tunnel_url = ""  # populated when cloudflared trycloudflare URL is captured
+_cf_proc = None   # module-level handle so console commands can restart it
 
 # ─── Screen State (AppState dataclass) ───────────────────
 #
@@ -2727,6 +2728,8 @@ _HELP_SECTIONS = [
         ("rotate-key", "New Fernet key (invalidate sessions)"),
         ("rotate-token", "New web auth token"),
         ("show-token", "Print current web auth token + file path"),
+        ("tunnel", "Show cloudflared tunnel URL + token"),
+        ("restart-tunnel", "Kill + relaunch cloudflared (new URL)"),
     ]),
 ]
 
@@ -3055,6 +3058,10 @@ def handle_command(cmd):
         _disp_rotate_token()
     elif action in ("show-token", "showtoken", "token"):
         _disp_show_token()
+    elif action in ("tunnel", "show-tunnel", "showtunnel"):
+        _disp_show_tunnel()
+    elif action in ("restart-tunnel", "restarttunnel", "change-tunnel", "changetunnel", "new-tunnel"):
+        _disp_restart_tunnel()
     else:
         add_console(f"{RED}Unknown: '{action}'. Type 'help' for commands.{RESET}")
 
@@ -3089,6 +3096,90 @@ def _disp_rotate_token():
         add_console(f"{GREEN}Web token rotated: {redacted}  (full token in {_TOKEN_PATH}){RESET}")
     except Exception as e:
         add_console(f"{RED}Token rotation failed: {_safe_error(e)}{RESET}")
+
+
+def _find_cloudflared_bin():
+    """Resolve cloudflared binary path. PATH → env override → fallback."""
+    return (
+        shutil.which("cloudflared")
+        or os.environ.get("NETWATCH_CLOUDFLARED_BIN")
+        or os.path.expanduser("~/agents/agent-office/cloudflared")
+    )
+
+
+def _start_cloudflared_tunnel():
+    """Spawn cloudflared trycloudflare tunnel pointed at WEB_PORT.
+
+    Updates module-level _cf_proc and (async) _tunnel_url. Caller is responsible
+    for stopping any existing process first.
+    """
+    global _cf_proc
+    cf_bin = _find_cloudflared_bin()
+    if not (cf_bin and os.path.isfile(cf_bin)):
+        return False, "cloudflared not found"
+    try:
+        _cf_proc = subprocess.Popen(
+            [cf_bin, "tunnel", "--url", f"http://localhost:{WEB_PORT}"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+    except Exception as e:
+        _cf_proc = None
+        return False, f"failed ({_safe_error(e)})"
+
+    def _parse():
+        global _tunnel_url
+        proc = _cf_proc  # snapshot — restart-tunnel may swap the global
+        if not proc or not proc.stdout:
+            return
+        for line in proc.stdout:
+            if "trycloudflare.com" in line:
+                m = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", line)
+                if m:
+                    url = m.group(0)
+                    if _cf_proc is proc:  # ignore stale parsers after restart
+                        _tunnel_url = url
+                        with lock:
+                            alerts.append({"time": datetime.now().strftime("%H:%M:%S"),
+                                           "msg": f"Tunnel: {url}"})
+                        add_console(f"{GREEN}Tunnel ready: {url}{RESET}")
+                    break
+
+    threading.Thread(target=_parse, daemon=True).start()
+    return True, cf_bin
+
+
+def _disp_show_tunnel():
+    """Print current tunnel URL + web token so user can hand off remote access."""
+    if _tunnel_url:
+        add_console(f"{GREEN}Tunnel    : {_tunnel_url}{RESET}")
+    else:
+        cf_bin = _find_cloudflared_bin()
+        if cf_bin and os.path.isfile(cf_bin):
+            add_console(f"{DIM}Tunnel    : starting / not yet ready (try again in a few seconds){RESET}")
+        else:
+            add_console(f"{DIM}Tunnel    : cloudflared not installed{RESET}")
+    add_console(f"{YELLOW}Web Token : {WEB_TOKEN}{RESET}")
+    add_console(f"{DIM}File      : {_TOKEN_PATH} (0600){RESET}")
+
+
+def _disp_restart_tunnel():
+    """Kill current cloudflared and spawn a fresh one (gets a new trycloudflare URL)."""
+    global _cf_proc, _tunnel_url
+    proc = _cf_proc
+    if proc is not None:
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except Exception:
+            try: proc.kill()
+            except Exception: pass
+        _cf_proc = None
+    _tunnel_url = ""
+    ok, info = _start_cloudflared_tunnel()
+    if ok:
+        add_console(f"{DIM}Tunnel restarting via {info} — new URL will appear shortly (try 'tunnel'){RESET}")
+    else:
+        add_console(f"{RED}Tunnel restart failed: {info}{RESET}")
 
 # ─── OSINT command-handler helpers ───────────────────────
 # Most _cmd_* handlers follow the same shape: call OSINT fn → check error →
@@ -7493,8 +7584,6 @@ def main():
     print(f"  {DIM}Logs: {LOG_DIR}/{RESET}")
     print(f"  {DIM}nmap: use 'scan <target>' via API or edit code{RESET}\n")
 
-    _cf_proc = None
-
     def shutdown(sig, frame):
         print(f"\n{YELLOW}[*] Shutting down NetWatch...{RESET}")
         stop_tcpdump()
@@ -7551,8 +7640,8 @@ def main():
     web_thread.start()
     print(f"  {GREEN}Web Dashboard   : http://0.0.0.0:{WEB_PORT}{RESET}")
     _persist_web_token(WEB_TOKEN)
-    _redacted = f"{WEB_TOKEN[:6]}…{WEB_TOKEN[-4:]}" if len(WEB_TOKEN) >= 12 else "(short)"
-    print(f"  {YELLOW}Web Token       : {_redacted}  (full token in {_TOKEN_PATH}, 0600){RESET}")
+    print(f"  {YELLOW}Web Token       : {WEB_TOKEN}{RESET}")
+    print(f"  {DIM}Token file      : {_TOKEN_PATH} (0600) — type 'token' in console to reprint{RESET}")
 
     # Time-series sampling for charts
     threading.Thread(target=_sample_timeseries, daemon=True).start()
@@ -7570,37 +7659,12 @@ def main():
     if _HAS_GQL:
         print(f"  {GREEN}GraphQL IDE     : http://0.0.0.0:{WEB_PORT}/graphql{RESET}")
 
-    # Cloudflare tunnel for remote access — prefer PATH, then env override,
-    # then common install locations. Missing → tunnel just not started.
-    _cf_bin = (
-        shutil.which("cloudflared")
-        or os.environ.get("NETWATCH_CLOUDFLARED_BIN")
-        or os.path.expanduser("~/agents/agent-office/cloudflared")
-    )
-    if _cf_bin and os.path.isfile(_cf_bin):
-        try:
-            _cf_proc = subprocess.Popen(
-                [_cf_bin, "tunnel", "--url", f"http://localhost:{WEB_PORT}"],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
-            )
-            def _parse_tunnel():
-                global _tunnel_url
-                for line in _cf_proc.stdout:
-                    if "trycloudflare.com" in line:
-                        m = re.search(r'https://[a-z0-9-]+\.trycloudflare\.com', line)
-                        if m:
-                            url = m.group(0)
-                            _tunnel_url = url
-                            print(f"  {GREEN}Remote Access   : {url}{RESET}")
-                            with lock:
-                                alerts.append({"time": datetime.now().strftime("%H:%M:%S"),
-                                               "msg": f"Tunnel: {url}"})
-                            break
-            threading.Thread(target=_parse_tunnel, daemon=True).start()
-        except Exception as e:
-            print(f"  {DIM}Tunnel          : failed ({e}){RESET}")
+    # Cloudflare tunnel for remote access — helper handles PATH/env/fallback.
+    _cf_ok, _cf_info = _start_cloudflared_tunnel()
+    if _cf_ok:
+        print(f"  {GREEN}Tunnel          : starting via {_cf_info} (URL prints when ready; type 'tunnel' to recheck){RESET}")
     else:
-        print(f"  {DIM}Tunnel          : cloudflared not found{RESET}")
+        print(f"  {DIM}Tunnel          : {_cf_info}{RESET}")
 
     def _read_key(fd):
         ch = os.read(fd, 1).decode('utf-8', errors='replace')
