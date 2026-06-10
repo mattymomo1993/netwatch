@@ -100,6 +100,30 @@ chmod +x netwatch-start.sh
 sudo ln -s $(pwd)/netwatch-start.sh /usr/local/bin/netwatch
 ```
 
+**Docker (one-liner):**
+```bash
+docker run -d --name netwatch --restart unless-stopped \
+  --network host --cap-add NET_ADMIN --cap-add NET_RAW \
+  -e NETWATCH_TELNET_PORT=23 -e NETWATCH_FTP_PORT=21 \
+  -e NETWATCH_HTTP_PORT=80 -e NETWATCH_RTSP_PORT=554 \
+  -v netwatch-logs:/app/logs \
+  ghcr.io/mattmorris-dev/netwatch-sec:latest eth0
+```
+This runs headless: honeypots on standard ports (23/21/80/554) + the web dashboard on `:9090`. System tools (nmap, tshark, tcpdump, …) are baked into the image. Multi-arch — works on x86-64 and ARM64 (Raspberry Pi). Swap `eth0` for your capture interface.
+
+Or with Compose:
+```bash
+docker compose up -d        # uses docker-compose.yml
+docker compose logs -f      # watch attacks
+```
+
+Watch the attack feed (clean JSON, one line per hit):
+```bash
+docker exec netwatch tail -f /app/logs/all_events.json
+```
+
+> `--network host` and the `NET_ADMIN`/`NET_RAW` caps let NetWatch bind privileged ports and capture traffic. Host networking is Linux-only; on macOS/Windows drop `--network host` and publish ports with `-p` instead (capture features are limited there).
+
 ## Quick Start
 
 ```bash

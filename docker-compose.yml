@@ -1,0 +1,29 @@
+# NetWatch — quick start: `docker compose up -d`
+# Honeypot on standard ports (23/21/80/554) + web dashboard on 9090.
+services:
+  netwatch:
+    image: ghcr.io/mattmorris-dev/netwatch-sec:latest
+    # To build from source instead of pulling the published image, comment the
+    # image line above and uncomment:
+    # build: .
+    container_name: netwatch
+    restart: unless-stopped
+    # Host networking: see real traffic and bind host ports directly (Linux only).
+    network_mode: host
+    cap_add:
+      - NET_ADMIN   # iptables autoblock
+      - NET_RAW     # tcpdump / tshark capture
+    environment:
+      NETWATCH_TELNET_PORT: "23"
+      NETWATCH_FTP_PORT: "21"
+      NETWATCH_HTTP_PORT: "80"
+      NETWATCH_RTSP_PORT: "554"
+      # Set a fixed dashboard token (otherwise a random one is generated):
+      # NETWATCH_TOKEN: "change-me"
+    volumes:
+      - netwatch-logs:/app/logs
+    # Capture interface — change if yours isn't eth0.
+    command: ["eth0"]
+
+volumes:
+  netwatch-logs:
