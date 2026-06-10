@@ -1254,6 +1254,134 @@ class TestSSRFDefense:
 
 
 # ═══════════════════════════════════════════════════════════
+#  SSRF: DNS-rebinding / all-records hardening (1.2.2)
+# ═══════════════════════════════════════════════════════════
+
+def _gai(*ips):
+    """Build a getaddrinfo return value from one or more IP strings."""
+    return [(None, None, None, None, (ip, 0)) for ip in ips]
+
+
+class TestRebindingHardening:
+    """Every resolved record must be validated, not just the first — a
+    rebinding answer that pairs a public and a private address must be
+    refused as a whole."""
+
+    def test_mixed_public_then_private_refused(self):
+        with patch("netwatch.socket.getaddrinfo", return_value=_gai("93.184.216.34", "169.254.169.254")):
+            ok, reason = netwatch._validate_target_url("http://rebind.evil.com/")
+            assert not ok
+            assert "private" in reason or "internal" in reason
+
+    def test_mixed_private_then_public_refused(self):
+        with patch("netwatch.socket.getaddrinfo", return_value=_gai("10.0.0.5", "93.184.216.34")):
+            ok, _ = netwatch._validate_target_host("rebind.evil.com")
+            assert not ok
+
+    def test_is_internal_target_checks_all_records(self):
+        with patch("netwatch.socket.getaddrinfo", return_value=_gai("1.1.1.1", "127.0.0.1")):
+            assert netwatch._is_internal_target("rebind.evil.com") is True
+
+    def test_all_public_records_allowed(self):
+        with patch("netwatch.socket.getaddrinfo", return_value=_gai("93.184.216.34", "1.1.1.1")):
+            ok, _ = netwatch._validate_target_url("http://safe.example.com/")
+            assert ok
+
+    def test_ipv4_mapped_metadata_refused(self):
+        # ::ffff:169.254.169.254 must be unwrapped and refused, not treated as v6.
+        with patch("netwatch.socket.getaddrinfo", return_value=_gai("::ffff:169.254.169.254")):
+            ok, _ = netwatch._validate_target_host("mapped.evil.com")
+            assert not ok
+
+    def test_cgnat_100_64_refused(self):
+        with patch("netwatch.socket.getaddrinfo", return_value=_gai("100.64.0.1")):
+            ok, _ = netwatch._validate_target_url("http://cgnat.evil.com/")
+            assert not ok
+
+    def test_multicast_refused(self):
+        with patch("netwatch.socket.getaddrinfo", return_value=_gai("224.0.0.1")):
+            ok, _ = netwatch._validate_target_host("mcast.evil.com")
+            assert not ok
+
+    def test_ipv6_unique_local_refused(self):
+        # fc00::/7 is private in v6.
+        with patch("netwatch.socket.getaddrinfo", return_value=_gai("fd00::1")):
+            ok, _ = netwatch._validate_target_url("http://v6priv.evil.com/")
+            assert not ok
+
+    def test_literal_metadata_ip_refused_without_dns(self):
+        # Literal IP is judged directly — must not depend on (mockable) DNS.
+        with patch("netwatch.socket.getaddrinfo", return_value=_gai("93.184.216.34")):
+            ok, _ = netwatch._validate_target_url("http://169.254.169.254/latest/meta-data/")
+            assert not ok
+
+    def test_resolve_safe_returns_first_public_ip(self):
+        with patch("netwatch.socket.getaddrinfo", return_value=_gai("93.184.216.34", "1.1.1.1")):
+            ip, reason = netwatch._resolve_safe("safe.example.com")
+            assert ip == "93.184.216.34"
+            assert reason is None
+
+    def test_resolve_safe_dns_error_fails_closed(self):
+        with patch("netwatch.socket.getaddrinfo", side_effect=Exception("nxdomain")):
+            ip, reason = netwatch._resolve_safe("nope.invalid")
+            assert ip is None
+            assert "failed" in reason.lower()
+
+
+class TestProxiedGetPinning:
+    """_proxied_get must re-validate + pin the connection on the direct path
+    so the resolution can't change between validate and fetch."""
+
+    @patch("netwatch._get_proxy", return_value=None)
+    @patch("netwatch._proxy_session")
+    def test_http_pinned_to_validated_ip(self, mock_session, _mock_proxy):
+        sess = MagicMock()
+        sess.get.return_value = MagicMock(status_code=200)
+        mock_session.return_value = sess
+        with patch("netwatch.socket.getaddrinfo", return_value=_gai("93.184.216.34")):
+            netwatch._proxied_get("http://example.com/json/1.2.3.4")
+        called_url = sess.get.call_args[0][0]
+        called_headers = sess.get.call_args[1].get("headers")
+        assert "93.184.216.34" in called_url
+        assert "example.com" not in called_url
+        assert called_headers and called_headers.get("Host") == "example.com"
+
+    @patch("netwatch._get_proxy", return_value=None)
+    @patch("netwatch._proxy_session")
+    def test_direct_rebind_to_private_returns_none(self, mock_session, _mock_proxy):
+        sess = MagicMock()
+        mock_session.return_value = sess
+        with patch("netwatch.socket.getaddrinfo", return_value=_gai("10.0.0.9")):
+            result = netwatch._proxied_get("http://rebind.evil.com/x")
+        assert result is None
+        sess.get.assert_not_called()
+
+    @patch("netwatch._get_proxy", return_value=None)
+    @patch("netwatch._proxy_session")
+    def test_https_not_rewritten_to_ip(self, mock_session, _mock_proxy):
+        # HTTPS keeps the hostname so TLS SNI/cert validation still works.
+        sess = MagicMock()
+        sess.get.return_value = MagicMock(status_code=200)
+        mock_session.return_value = sess
+        with patch("netwatch.socket.getaddrinfo", return_value=_gai("93.184.216.34")):
+            netwatch._proxied_get("https://example.com/path")
+        called_url = sess.get.call_args[0][0]
+        assert called_url == "https://example.com/path"
+
+    @patch("netwatch._get_proxy", return_value={"type": "socks5", "host": "127.0.0.1", "port": 9050})
+    @patch("netwatch._proxy_session")
+    def test_proxy_path_not_pinned(self, mock_session, _mock_proxy):
+        # Through a proxy the remote resolver does DNS; we must not rewrite.
+        sess = MagicMock()
+        sess.get.return_value = MagicMock(status_code=200)
+        mock_session.return_value = sess
+        with patch("netwatch.socket.getaddrinfo", return_value=_gai("93.184.216.34")):
+            netwatch._proxied_get("http://example.com/y")
+        called_url = sess.get.call_args[0][0]
+        assert called_url == "http://example.com/y"
+
+
+# ═══════════════════════════════════════════════════════════
 #  TLS CERT_NONE INTENTIONAL VERIFICATION
 # ═══════════════════════════════════════════════════════════
 

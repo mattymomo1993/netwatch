@@ -70,7 +70,7 @@ for _i, _a in enumerate(sys.argv):
     if _a == "--token" and _i + 1 < len(sys.argv):
         _cli_token = sys.argv[_i + 1]
         break
-VERSION = "1.2.1"
+VERSION = "1.2.2"
 
 # Honeypot listener ports — overridable via env so deployments can move to
 # standard ports (80/23/21/554) without local sed against the repo.
@@ -1990,14 +1990,9 @@ def osint_crt(domain):
 def osint_headers(url):
     if not url.startswith("http"):
         url = "http://" + url
-    from urllib.parse import urlparse
-    parsed = urlparse(url)
-    try:
-        resolved = socket.getaddrinfo(parsed.hostname, None)[0][4][0]
-        if ipaddress.ip_address(resolved).is_private:
-            return {"error": "refused: target resolves to private IP"}
-    except Exception:
-        pass
+    ok, reason = _validate_target_url(url)
+    if not ok:
+        return {"error": reason}
     r = _proxied_get(url, timeout=10)
     if not r:
         return {"error": "request failed"}
@@ -2015,34 +2010,74 @@ def osint_headers(url):
         return {"error": str(e)}
 
 
+# RFC 6598 carrier-grade NAT — internal but not flagged by is_private.
+_CGNAT_NET = ipaddress.ip_network("100.64.0.0/10")
+
+
+def _ip_is_dangerous(addr):
+    """True if addr falls in any range an SSRF guard must refuse.
+    Unwraps IPv4-mapped IPv6 (e.g. ::ffff:169.254.169.254) first so a
+    mapped metadata address can't sneak past the v6 checks."""
+    if addr.version == 6 and addr.ipv4_mapped is not None:
+        addr = addr.ipv4_mapped
+    return (addr.is_private or addr.is_loopback or addr.is_link_local
+            or addr.is_reserved or addr.is_multicast or addr.is_unspecified
+            or addr in _CGNAT_NET)
+
+
+def _resolve_safe(host):
+    """Resolve host and validate EVERY returned record across all address
+    families. Fail closed: any internal/reserved answer — or a DNS error —
+    refuses the whole host. Checking all records (not just the first) defeats
+    rebinding responses that pair one public and one private address.
+    Returns (validated_ip, None) or (None, reason). A literal IP is checked
+    directly without a DNS round-trip."""
+    try:
+        literal = ipaddress.ip_address(host)
+        if _ip_is_dangerous(literal):
+            return None, "refused: resolves to private/internal IP"
+        return host, None
+    except ValueError:
+        pass
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception:
+        return None, "DNS resolution failed"
+    first = None
+    for info in infos:
+        raw = info[4][0]
+        try:
+            addr = ipaddress.ip_address(raw)
+        except ValueError:
+            return None, "refused: unparseable resolved address"
+        if _ip_is_dangerous(addr):
+            return None, "refused: resolves to private/internal IP"
+        if first is None:
+            first = raw
+    if first is None:
+        return None, "DNS resolution failed"
+    return first, None
+
+
 def _validate_target_url(url):
     from urllib.parse import urlparse
     parsed = urlparse(url)
     hostname = parsed.hostname
     if not hostname:
         return False, "no hostname"
-    blocked = {"localhost", "127.0.0.1", "0.0.0.0", "::1", "metadata.google.internal",
-               "metadata", "instance-data"}
-    if hostname in blocked:
+    if hostname.lower() in {"localhost", "metadata.google.internal",
+                            "metadata", "instance-data"}:
         return False, "blocked internal host"
-    try:
-        resolved = socket.getaddrinfo(hostname, None)[0][4][0]
-        addr = ipaddress.ip_address(resolved)
-        if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved:
-            return False, "refused: resolves to private IP"
-    except Exception:
-        return False, "DNS resolution failed"
+    ip, reason = _resolve_safe(hostname)
+    if not ip:
+        return False, reason
     return True, ""
 
 
 def _validate_target_host(target):
-    try:
-        resolved = socket.getaddrinfo(target, None)[0][4][0]
-        addr = ipaddress.ip_address(resolved)
-        if addr.is_private or addr.is_loopback or addr.is_link_local:
-            return False, "refused: target resolves to private IP"
-    except Exception:
-        return False, "DNS resolution failed"
+    ip, reason = _resolve_safe(target)
+    if not ip:
+        return False, reason
     return True, ""
 
 
@@ -4360,8 +4395,36 @@ def _proxied_get(url, timeout=10):
     sess = _proxy_session(proxy)
     if not sess:
         return None
+    headers = None
+    # Direct path only: re-resolve and pin right before the fetch so a DNS
+    # rebinding answer can't swap in an internal address between an earlier
+    # validate() and this GET. Through a proxy the remote resolver does DNS,
+    # so rebinding against this host isn't reachable — skip pinning there.
+    _env_proxy = os.environ.get("HTTP_PROXY") or os.environ.get("HTTPS_PROXY")
+    if not proxy and not _env_proxy:
+        from urllib.parse import urlparse, urlunparse
+        parsed = urlparse(url)
+        host = parsed.hostname
+        if host:
+            try:
+                ipaddress.ip_address(host)
+                literal = True
+            except ValueError:
+                literal = False
+            if not literal:
+                ip, _reason = _resolve_safe(host)
+                if not ip:
+                    return None
+                # Pin http:// to the validated IPv4 (metadata SSRF is always
+                # plain http) and carry Host so the vhost still routes. Leave
+                # https:// on the hostname — it was validated microseconds ago
+                # and rewriting to an IP would break TLS SNI/cert validation.
+                if parsed.scheme == "http" and ":" not in ip:
+                    netloc = f"{ip}:{parsed.port}" if parsed.port else ip
+                    url = urlunparse(parsed._replace(netloc=netloc))
+                    headers = {"Host": host}
     try:
-        return sess.get(url, timeout=timeout)
+        return sess.get(url, timeout=timeout, headers=headers)
     except Exception:
         return None
 
@@ -5688,18 +5751,19 @@ _OUTBOUND_CMDS = {"geo", "whois", "dnsinfo", "crt", "headers", "asn", "abuse",
 
 def _is_internal_target(target):
     try:
-        ip = ipaddress.ip_address(target)
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
-            return True
+        return _ip_is_dangerous(ipaddress.ip_address(target))
     except ValueError:
         pass
     try:
-        for info in socket.getaddrinfo(target, None, socket.AF_INET):
-            ip = ipaddress.ip_address(info[4][0])
-            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
-                return True
+        infos = socket.getaddrinfo(target, None)
     except Exception:
         return True
+    for info in infos:
+        try:
+            if _ip_is_dangerous(ipaddress.ip_address(info[4][0])):
+                return True
+        except ValueError:
+            return True
     return False
 
 _cmd_rate = {}  # ip -> (count, expensive_count, window_start)
