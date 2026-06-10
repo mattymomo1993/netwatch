@@ -2,6 +2,23 @@
 
 All notable changes to NetWatch are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 1.2.2 — 2026-06-10
+
+### Security
+- Hardened SSRF guards against DNS rebinding. The OSINT validators
+  (`_validate_target_url`, `_validate_target_host`, `_is_internal_target`) now
+  share one resolver that checks **every** A/AAAA record (not just the first),
+  so a rebinding answer pairing a public and a private address is refused as a
+  whole. Coverage extended to IPv4-mapped IPv6 (`::ffff:169.254.169.254`),
+  RFC 6598 carrier-grade NAT (`100.64.0.0/10`), multicast, and unspecified.
+- `_proxied_get` now re-resolves and pins the connection immediately before the
+  fetch on the direct (non-proxy) path, closing the validate→fetch TOCTOU
+  window. Plain-HTTP requests are pinned to the validated IP with the original
+  `Host` header (cloud-metadata SSRF is always HTTP); HTTPS keeps its hostname
+  so TLS SNI/cert validation is preserved.
+- `osint_headers` no longer fails **open** on DNS error and now blocks
+  loopback/link-local/metadata targets (previously only `is_private`).
+
 ## 1.2.1 — 2026-06-09
 
 ### Fixed
