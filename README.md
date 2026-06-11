@@ -124,6 +124,8 @@ docker exec netwatch tail -f /app/logs/all_events.json
 
 > `--network host` and the `NET_ADMIN`/`NET_RAW` caps let NetWatch bind privileged ports and capture traffic. Host networking is Linux-only; on macOS/Windows drop `--network host` and publish ports with `-p` instead (capture features are limited there).
 
+**Verify your install:** start NetWatch and run `doctor` (aliases `deps`/`check`) at the prompt — it lists every required Python package and system tool with present/missing status, flags passive (non-root) mode, and tells you what to install for anything missing.
+
 ## Quick Start
 
 ```bash

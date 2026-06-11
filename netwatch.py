@@ -2595,6 +2595,7 @@ except ImportError:
     _HAS_MESH = False
 
 mesh_interface = None
+_mesh_last_error = ""   # why the last connect attempt failed (shown in mesh tab / doctor)
 mesh_messages = []
 mesh_nodes = {}
 mesh_alert_fwd = True
@@ -3021,6 +3022,7 @@ def handle_command(cmd):
         "blockall": (1, _disp_blockall), "tag": (1, _disp_tag), "note": (1, _disp_note),
         "watch": (1, _disp_watch), "mesh": (1, _disp_mesh), "ifinfo": (1, _disp_ifinfo),
         "proxy": (1, _disp_proxy), "replay": (1, _disp_replay),
+        "doctor": (1, _disp_doctor), "deps": (1, _disp_doctor), "check": (1, _disp_doctor),
     }
 
     if action in _DIRECT_CMDS:
@@ -3094,7 +3096,7 @@ def handle_command(cmd):
     elif action in ("show-token", "showtoken", "token"):
         _disp_show_token()
     elif action in ("tunnel", "show-tunnel", "showtunnel"):
-        _disp_show_tunnel()
+        _disp_show_tunnel(parts)
     elif action in ("restart-tunnel", "restarttunnel", "change-tunnel", "changetunnel", "new-tunnel"):
         _disp_restart_tunnel()
     else:
@@ -3133,13 +3135,74 @@ def _disp_rotate_token():
         add_console(f"{RED}Token rotation failed: {_safe_error(e)}{RESET}")
 
 
+def _cloudflared_arch():
+    """Map the host arch to cloudflared's release asset suffix."""
+    import platform
+    m = platform.machine().lower()
+    if m in ("x86_64", "amd64"):
+        return "amd64"
+    if m in ("aarch64", "arm64"):
+        return "arm64"
+    if m.startswith("arm"):
+        return "arm"
+    if m in ("i386", "i686", "x86"):
+        return "386"
+    return "amd64"
+
+
 def _find_cloudflared_bin():
-    """Resolve cloudflared binary path. PATH → env override → fallback."""
-    return (
-        shutil.which("cloudflared")
-        or os.environ.get("NETWATCH_CLOUDFLARED_BIN")
-        or os.path.expanduser("~/agents/agent-office/cloudflared")
-    )
+    """Resolve cloudflared across platforms: PATH → env → common locations
+    (incl. Termux $PREFIX/bin and ~/.local/bin). Returns a path or None."""
+    p = shutil.which("cloudflared")
+    if p:
+        return p
+    env = os.environ.get("NETWATCH_CLOUDFLARED_BIN")
+    if env and os.path.isfile(env):
+        return env
+    candidates = [
+        os.path.expanduser("~/.local/bin/cloudflared"),
+        "/usr/local/bin/cloudflared",
+        "/usr/bin/cloudflared",
+        os.path.expanduser("~/agents/agent-office/cloudflared"),
+    ]
+    prefix = os.environ.get("PREFIX")  # Termux
+    if prefix:
+        candidates.insert(0, os.path.join(prefix, "bin", "cloudflared"))
+    for c in candidates:
+        if c and os.path.isfile(c):
+            return c
+    return None
+
+
+def _cloudflared_install_hint():
+    """Exact per-platform install line for cloudflared."""
+    arch = _cloudflared_arch()
+    base = f"https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-{arch}"
+    if IS_TERMUX:
+        return f"pkg install cloudflared   (or: curl -L -o $PREFIX/bin/cloudflared {base} && chmod +x $PREFIX/bin/cloudflared)"
+    return f"curl -L -o ~/.local/bin/cloudflared {base} && chmod +x ~/.local/bin/cloudflared"
+
+
+def _download_cloudflared():
+    """Confirm-first auto-download of the official cloudflared binary for this
+    arch into ~/.local/bin. Only called by an explicit `tunnel install`."""
+    import urllib.request
+    arch = _cloudflared_arch()
+    url = f"https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-{arch}"
+    dest = os.path.join(os.environ.get("PREFIX", os.path.expanduser("~/.local")), "bin", "cloudflared") \
+        if os.environ.get("PREFIX") else os.path.expanduser("~/.local/bin/cloudflared")
+    try:
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        add_console(f"{DIM}Downloading cloudflared ({arch}) from cloudflare/cloudflared releases…{RESET}")
+        tmp = dest + ".tmp"
+        urllib.request.urlretrieve(url, tmp)
+        os.chmod(tmp, 0o700)
+        os.replace(tmp, dest)
+        add_console(f"{GREEN}cloudflared installed: {dest}{RESET}")
+        return dest
+    except Exception as e:
+        add_console(f"{RED}cloudflared download failed: {_safe_error(e)}{RESET}")
+        return None
 
 
 def _start_cloudflared_tunnel():
@@ -3183,16 +3246,24 @@ def _start_cloudflared_tunnel():
     return True, cf_bin
 
 
-def _disp_show_tunnel():
-    """Print current tunnel URL + web token so user can hand off remote access."""
+def _disp_show_tunnel(parts=None):
+    """Show tunnel URL + token. `tunnel install` confirm-downloads cloudflared;
+    when it's missing, print the exact per-platform install line."""
+    parts = parts or []
+    if len(parts) > 1 and parts[1] in ("install", "download", "get"):
+        dest = _download_cloudflared()
+        if dest:
+            add_console(f"{DIM}Now run 'restart-tunnel' to start it.{RESET}")
+        return
+    cf_bin = _find_cloudflared_bin()
     if _tunnel_url:
         add_console(f"{GREEN}Tunnel    : {_tunnel_url}{RESET}")
+    elif cf_bin and os.path.isfile(cf_bin):
+        add_console(f"{DIM}Tunnel    : starting / not yet ready (try again in a few seconds){RESET}")
     else:
-        cf_bin = _find_cloudflared_bin()
-        if cf_bin and os.path.isfile(cf_bin):
-            add_console(f"{DIM}Tunnel    : starting / not yet ready (try again in a few seconds){RESET}")
-        else:
-            add_console(f"{DIM}Tunnel    : cloudflared not installed{RESET}")
+        add_console(f"{DIM}Tunnel    : cloudflared not found{RESET}")
+        add_console(f"{YELLOW}Install   : {_cloudflared_install_hint()}{RESET}")
+        add_console(f"{DIM}Or run 'tunnel install' to auto-download it here.{RESET}")
     add_console(f"{YELLOW}Web Token : {WEB_TOKEN}{RESET}")
     add_console(f"{DIM}File      : {_TOKEN_PATH} (0600){RESET}")
 
@@ -3215,6 +3286,63 @@ def _disp_restart_tunnel():
         add_console(f"{DIM}Tunnel restarting via {info} — new URL will appear shortly (try 'tunnel'){RESET}")
     else:
         add_console(f"{RED}Tunnel restart failed: {info}{RESET}")
+
+
+# ─── doctor: dependency + environment self-check ─────────────────────────
+# (module, pip-install-name)
+_REQUIRED_PIP = [("flask", "flask"), ("markupsafe", "markupsafe"),
+                 ("requests", "requests"), ("whois", "python-whois"),
+                 ("dns", "dnspython"), ("cryptography", "cryptography")]
+_OPTIONAL_PIP = [("meshtastic", "meshtastic"), ("graphene", "graphene"),
+                 ("speedtest", "speedtest-cli")]
+_SYS_BINS = ["nmap", "tshark", "tcpdump", "traceroute", "ip", "iptables",
+             "openssl", "curl", "host", "whois", "arp-scan", "fuser", "cloudflared"]
+
+
+def _disp_doctor(parts):
+    """Report which Python deps + system tools are present, the run environment,
+    and which features are disabled by anything missing."""
+    import importlib.util
+    add_console(f"{BOLD}NetWatch doctor — dependencies + environment{RESET}")
+    add_console(f"  Env: root={'yes' if IS_ROOT else 'no'}  "
+                f"termux={'yes' if IS_TERMUX else 'no'}  "
+                f"capture={'on' if HAS_RAW_NET else 'PASSIVE (needs root, non-Termux)'}")
+    if not HAS_RAW_NET:
+        add_console(f"  {YELLOW}Passive mode: sniff/tcpdump/tshark/iptables disabled. "
+                    f"Honeypots + dashboard + OSINT still work.{RESET}")
+
+    add_console(f"{BOLD}Python packages{RESET}")
+    missing_req = []
+    for mod, pkg in _REQUIRED_PIP:
+        ok = importlib.util.find_spec(mod) is not None
+        if ok:
+            add_console(f"  [{GREEN}OK{RESET}] {pkg}")
+        else:
+            missing_req.append(pkg)
+            add_console(f"  [{RED}MISSING{RESET}] {pkg}  → pip install {pkg}")
+    for mod, pkg in _OPTIONAL_PIP:
+        ok = importlib.util.find_spec(mod) is not None
+        tag = f"{GREEN}OK{RESET}" if ok else f"{DIM}optional{RESET}"
+        add_console(f"  [{tag}] {pkg}")
+
+    add_console(f"{BOLD}System tools{RESET}")
+    for b in _SYS_BINS:
+        path = shutil.which(b)
+        if path:
+            add_console(f"  [{GREEN}OK{RESET}] {b}")
+        else:
+            add_console(f"  [{RED}MISSING{RESET}] {b}")
+
+    if missing_req:
+        add_console(f"  {RED}Install required deps: pip install {' '.join(missing_req)}{RESET}")
+    if not (_find_cloudflared_bin() or shutil.which("cloudflared")):
+        add_console(f"  {YELLOW}cloudflared missing → remote tunnel unavailable. "
+                    f"Install: {_cloudflared_install_hint()}{RESET}")
+        add_console(f"  {DIM}Or run 'tunnel install' to auto-download it.{RESET}")
+    if importlib.util.find_spec("meshtastic") is None:
+        add_console(f"  {DIM}meshtastic missing → mesh disabled (pip install meshtastic).{RESET}")
+    add_console(f"  {DIM}Mesh device: set NETWATCH_MESH_PORT=/dev/ttyACM0 if auto-detect misses it.{RESET}")
+
 
 # ─── OSINT command-handler helpers ───────────────────────
 # Most _cmd_* handlers follow the same shape: call OSINT fn → check error →
@@ -4924,6 +5052,9 @@ def _section_mesh(limit=20):
     if mesh_interface is None:
         lines.append(f"  {YELLOW}No mesh radio detected. Connect a LoRa device via USB.{RESET}")
         lines.append(f"  {DIM}Supported: T-Beam, Heltec, RAK, LilyGo{RESET}")
+        if _mesh_last_error:
+            lines.append(f"  {DIM}Last attempt: {_mesh_last_error}{RESET}")
+        lines.append(f"  {DIM}Tip: NETWATCH_MESH_PORT=/dev/ttyACM0 to force a device.{RESET}")
         return lines
     lines.append(f"  {BOLD}{GREEN}MESH RADIO CONNECTED{RESET}")
     lines.append(f"  {DIM}Nodes: {len(mesh_nodes)}  |  Messages: {len(mesh_messages)}  |  Alert fwd: {'ON' if mesh_alert_fwd else 'OFF'}{RESET}")
@@ -7310,11 +7441,20 @@ def web_timeseries():
 # -- MESHTASTIC MESH RADIO
 
 def _mesh_connect():
-    global mesh_interface
+    global mesh_interface, _mesh_last_error
     if not _HAS_MESH:
+        _mesh_last_error = "meshtastic not installed (pip install meshtastic)"
         return False
     import glob
-    ports = glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*")
+    # Explicit device wins (e.g. NETWATCH_MESH_PORT=/dev/ttyACM0 for the LilyGo);
+    # otherwise auto-detect USB serial.
+    explicit = os.environ.get("NETWATCH_MESH_PORT", "").strip()
+    ports = [explicit] if explicit else sorted(glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*"))
+    if not ports:
+        _mesh_last_error = "no serial device found — set NETWATCH_MESH_PORT or plug in the device"
+        add_console(f"  {YELLOW}Mesh: {_mesh_last_error}{RESET}")
+        return False
+    last = ""
     for port in ports:
         try:
             mesh_interface = _mesh_serial.SerialInterface(port)
@@ -7323,9 +7463,14 @@ def _mesh_connect():
                 pub.subscribe(_on_mesh_recv, "meshtastic.receive")
             except ImportError:
                 pass
+            _mesh_last_error = ""
+            add_console(f"  {GREEN}Mesh: connected on {port}{RESET}")
             return True
-        except Exception:
+        except Exception as e:
+            last = f"{port}: {type(e).__name__}"
             continue
+    _mesh_last_error = f"could not open mesh device ({last})"
+    add_console(f"  {YELLOW}Mesh: {_mesh_last_error}{RESET}")
     return False
 
 def _on_mesh_recv(packet, interface=None):

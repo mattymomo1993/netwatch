@@ -110,9 +110,10 @@ class TestWebAuth:
             headers={"Origin": f"http://127.0.0.1:{netwatch.WEB_PORT}"},
         )
         assert resp.status_code == 200
-        cookies = {c.name: c.value for c in web_client.cookie_jar}
-        assert "nw_token" in cookies
-        decrypted = netwatch._fernet.decrypt(cookies["nw_token"].encode()).decode()
+        # Werkzeug 3.x dropped client.cookie_jar — use get_cookie().
+        cookie = web_client.get_cookie("nw_token")
+        assert cookie is not None
+        decrypted = netwatch._fernet.decrypt(cookie.value.encode()).decode()
         assert decrypted == netwatch.WEB_TOKEN
 
     def test_post_auth_wrong_token_returns_401(self, web_client):

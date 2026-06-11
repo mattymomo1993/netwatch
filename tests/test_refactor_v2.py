@@ -199,7 +199,7 @@ class TestFernetEncryption:
             resp = client.post("/auth", json={"token": netwatch.WEB_TOKEN},
                                content_type="application/json")
             assert resp.status_code == 200
-            cookie = next((c for c in client.cookie_jar if c.name == "nw_token"), None)
+            cookie = client.get_cookie("nw_token")  # Werkzeug 3.x: no cookie_jar
             assert cookie is not None
             decrypted = netwatch._fernet.decrypt(cookie.value.encode()).decode()
             assert decrypted == netwatch.WEB_TOKEN
