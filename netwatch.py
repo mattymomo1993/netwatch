@@ -25,6 +25,7 @@ import select
 import struct
 import signal
 import random
+import queue
 import secrets
 import ipaddress
 import threading
@@ -2570,6 +2571,68 @@ console_mode = False
 _input_active = False
 _redraw_event = threading.Event()
 _render_lock = threading.Lock()
+
+# Long/blocking console commands run on a single serialized background worker so
+# the raw-terminal input loop never freezes and two heavy scans don't pile up.
+# Instant/local commands (help, status, clear, tab switches, block/unblock, …)
+# stay inline at the call site. Handlers emit via add_console(), which sets
+# _redraw_event, so threaded output still repaints correctly.
+_cmd_queue = queue.Queue()
+_cmd_worker_started = threading.Lock()
+_cmd_worker = None
+
+# Actions that do network / subprocess work and would block the input thread.
+# Everything not listed runs inline (instant local lookups, state edits, views).
+_BLOCKING_ACTIONS = frozenset({
+    "whois", "banner", "ssl", "ping", "track", "sniff", "subnet", "pcap",
+    "ports", "find", "report", "blocked", "ifinfo", "exportips",
+    "top", "ips", "new", "sus", "loud", "quiet", "whowatch",
+})
+
+
+def _command_worker_loop():
+    """Drain queued commands one at a time. Errors are isolated per command so
+    one bad handler never kills the worker (and thus the console)."""
+    while True:
+        cmd = _cmd_queue.get()
+        try:
+            handle_command(cmd)
+        except Exception:
+            pass
+        finally:
+            _redraw_event.set()
+            _cmd_queue.task_done()
+
+
+def _ensure_command_worker():
+    """Lazily start the single background command worker (daemon)."""
+    global _cmd_worker
+    with _cmd_worker_started:
+        if _cmd_worker is None or not _cmd_worker.is_alive():
+            _cmd_worker = threading.Thread(
+                target=_command_worker_loop, name="cmd-worker", daemon=True)
+            _cmd_worker.start()
+    return _cmd_worker
+
+
+def dispatch_command(cmd):
+    """Route a console command from the input loop.
+
+    Instant/local commands run inline so feedback is immediate and ordering is
+    obvious. Long/blocking commands are queued onto the single background worker
+    so the input loop returns immediately and stays responsive. Returns True if
+    the command was queued (async), False if it ran inline."""
+    parts = cmd.strip().split()
+    if not parts:
+        return False
+    action = parts[0].lower()
+    if action in _BLOCKING_ACTIONS:
+        _ensure_command_worker()
+        _cmd_queue.put(cmd)
+        return True
+    handle_command(cmd)
+    _redraw_event.set()
+    return False
 current_tab = "all"
 TABS = ["all", "hosts", "proto", "dns", "honeypot", "nmap", "arp", "alerts", "osint", "proxy", "mesh"]
 show_help_overlay = False
@@ -8160,10 +8223,9 @@ def main():
                     continue
 
                 _output_scroll = 0
-                def _run_inline(c):
-                    handle_command(c)
-                    _redraw_event.set()
-                threading.Thread(target=_run_inline, args=(cmd,), daemon=True).start()
+                # Long/blocking commands queue onto a single serialized worker so
+                # the input loop returns immediately; instant ones run inline.
+                dispatch_command(cmd)
           except KeyboardInterrupt:
             raise
           except Exception:
