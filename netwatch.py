@@ -81,6 +81,10 @@ TELNET_PORT = int(os.environ.get("NETWATCH_TELNET_PORT", "2323"))
 FTP_PORT    = int(os.environ.get("NETWATCH_FTP_PORT",    "2121"))
 RTSP_PORT   = int(os.environ.get("NETWATCH_RTSP_PORT",   "8554"))
 
+# Pro tier gate. Free (off) = basic attacker intel + upsell CTA only.
+# Pro (NETWATCH_PRO=1) = also runs the deep nmap port-scan + fingerprint recon.
+PRO_ENABLED = os.environ.get("NETWATCH_PRO") == "1"
+
 # ─── Colors ──────────────────────────────────────────────
 
 RED = "\033[91m"; GREEN = "\033[92m"; YELLOW = "\033[93m"
@@ -1141,6 +1145,92 @@ _recon_active = 0
 MAX_CONCURRENT_RECON = 3
 RECON_COOLDOWN_SECS = 3600
 
+def _ftp_basic_intel(ip):
+    """FREE tier: passive OSINT on the attacker (geo/ASN/rDNS/abuse).
+
+    Reuses the existing osint_* helpers — no port scanning, no fingerprinting.
+    Returns the gathered intel dict and writes it to the attacker report file.
+    """
+    geo = osint_geolocate(ip)
+    asn = osint_asn(ip)
+    rdns = osint_reverse_dns(ip)
+    abuse = osint_abuse(ip)
+
+    country = geo.get("country") or asn.get("country") or "?"
+    org = asn.get("org") or geo.get("org") or geo.get("isp") or "?"
+    asn_str = asn.get("as") or "?"
+    ptr = rdns.get("PTR")
+    if isinstance(ptr, list):
+        ptr = ", ".join(ptr) if ptr else "—"
+    ptr = ptr or "—"
+    abuse_str = abuse.get("blocklist_de", "?")
+    flags = [k for k in ("is_proxy", "is_hosting", "is_mobile") if abuse.get(k)]
+
+    report_file = os.path.join(LOG_DIR, f"attacker_{ip.replace('.','_')}.txt")
+    try:
+        with open(report_file, "a") as f:
+            f.write(f"\n{'='*50}\n")
+            f.write(f"Basic intel at {datetime.now().isoformat()}\n")
+            f.write(f"Country: {country}\nOrg/ISP: {org}\nASN: {asn_str}\n")
+            f.write(f"Reverse DNS: {ptr}\nAbuse (blocklist.de): {abuse_str}\n")
+            if flags:
+                f.write(f"Flags: {', '.join(flags)}\n")
+    except Exception:
+        pass
+
+    log_event("attacker_basic_intel", ip, {
+        "country": country, "org": org, "asn": asn_str,
+        "rdns": ptr, "abuse": abuse_str, "flags": flags,
+    })
+
+    ts = datetime.now().strftime("%H:%M:%S")
+    with lock:
+        alerts.append({"time": ts, "msg": f"INTEL {ip}: {country} | {org}"})
+        alerts.append({"time": ts, "msg": f"  ASN {asn_str} | rDNS {ptr} | abuse {abuse_str}"})
+    add_console(f"INTEL {ip}: {country} | {org} | ASN {asn_str} | rDNS {ptr} | abuse {abuse_str}")
+    return {"country": country, "org": org, "asn": asn_str,
+            "rdns": ptr, "abuse": abuse_str, "flags": flags}
+
+
+def _ftp_deep_recon(ip):
+    """PRO tier: deep nmap port/service scan + banner fingerprint of attacker."""
+    # Quick scan — check if THEY have FTP/SSH/HTTP open
+    result = subprocess.run(
+        ["nmap", "-sV", "-T4", "-p", "21,22,23,80,443,445,3389,5900,8080,8443",
+         "--open", "-oN", "-", ip],
+        capture_output=True, text=True, timeout=60
+    )
+    open_ports = []
+    for line in result.stdout.split("\n"):
+        if "open" in line and "/" in line:
+            open_ports.append(line.strip())
+
+    # Log their open services
+    report_file = os.path.join(LOG_DIR, f"attacker_{ip.replace('.','_')}.txt")
+    with open(report_file, "a") as f:
+        f.write(f"\n{'='*50}\n")
+        f.write(f"Auto-recon at {datetime.now().isoformat()}\n")
+        f.write(result.stdout)
+
+    with lock:
+        alerts.append({"time": datetime.now().strftime("%H:%M:%S"),
+                       "msg": f"RECON DONE: {ip} has {len(open_ports)} open ports"})
+        for p in open_ports[:3]:
+            alerts.append({"time": datetime.now().strftime("%H:%M:%S"),
+                           "msg": f"  {ip}: {p}"})
+
+    # Banner grab their FTP if open
+    for line in open_ports:
+        if "21/" in line:
+            banner = banner_grab(ip, 21)
+            with open(report_file, "a") as f:
+                f.write(f"\nFTP Banner: {banner}\n")
+            log_event("attacker_ftp_banner", ip, {"banner": banner})
+            with lock:
+                alerts.append({"time": datetime.now().strftime("%H:%M:%S"),
+                               "msg": f"ATTACKER FTP: {ip}:21 — {banner[:60]}"})
+
+
 def _ftp_auto_recon(ip):
     global _recon_active
     if is_whitelisted(ip) or ip in LOCAL_IPS:
@@ -1156,44 +1246,21 @@ def _ftp_auto_recon(ip):
 
     with lock:
         alerts.append({"time": datetime.now().strftime("%H:%M:%S"),
-                       "msg": f"AUTO-RECON: scanning FTP attacker {ip}..."})
+                       "msg": f"AUTO-RECON: gathering intel on FTP attacker {ip}..."})
 
     try:
-        # Quick scan — check if THEY have FTP/SSH/HTTP open
-        result = subprocess.run(
-            ["nmap", "-sV", "-T4", "-p", "21,22,23,80,443,445,3389,5900,8080,8443",
-             "--open", "-oN", "-", ip],
-            capture_output=True, text=True, timeout=60
-        )
-        open_ports = []
-        for line in result.stdout.split("\n"):
-            if "open" in line and "/" in line:
-                open_ports.append(line.strip())
+        # FREE tier: always gather basic passive OSINT intel.
+        _ftp_basic_intel(ip)
 
-        # Log their open services
-        report_file = os.path.join(LOG_DIR, f"attacker_{ip.replace('.','_')}.txt")
-        with open(report_file, "a") as f:
-            f.write(f"\n{'='*50}\n")
-            f.write(f"Auto-recon at {datetime.now().isoformat()}\n")
-            f.write(result.stdout)
-
-        with lock:
-            alerts.append({"time": datetime.now().strftime("%H:%M:%S"),
-                           "msg": f"RECON DONE: {ip} has {len(open_ports)} open ports"})
-            for p in open_ports[:3]:
+        # PRO-GATED: deep nmap port/service scan + fingerprint.
+        if not PRO_ENABLED:
+            add_console("🔒 Upgrade to Pro for full attacker port-scan + fingerprint")
+            with lock:
                 alerts.append({"time": datetime.now().strftime("%H:%M:%S"),
-                               "msg": f"  {ip}: {p}"})
+                               "msg": "🔒 Upgrade to Pro for full attacker port-scan + fingerprint"})
+            return
 
-        # Banner grab their FTP if open
-        for line in open_ports:
-            if "21/" in line:
-                banner = banner_grab(ip, 21)
-                with open(report_file, "a") as f:
-                    f.write(f"\nFTP Banner: {banner}\n")
-                log_event("attacker_ftp_banner", ip, {"banner": banner})
-                with lock:
-                    alerts.append({"time": datetime.now().strftime("%H:%M:%S"),
-                                   "msg": f"ATTACKER FTP: {ip}:21 — {banner[:60]}"})
+        _ftp_deep_recon(ip)
 
     except Exception as e:
         with lock:
@@ -1202,6 +1269,7 @@ def _ftp_auto_recon(ip):
     finally:
         with lock:
             _recon_active = max(0, _recon_active - 1)
+
 
 # -- TSHARK - Protocol Analysis
 
