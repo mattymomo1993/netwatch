@@ -142,6 +142,35 @@ def _ansi_strip(s):
     s = s.replace('\r', '')                              # Strip carriage returns (log forgery)
     return s
 
+
+_ANSI_CSI_RE = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
+
+
+def _clip_visible(s, width):
+    """Truncate an ANSI-colored string to `width` visible columns. Color escapes
+    are zero-width and copied verbatim; if the text is cut we append RESET so the
+    color doesn't bleed into the rest of the frame. Without this, a long line
+    (e.g. a tunnel URL or the web token) wraps and breaks the fixed TUI layout."""
+    if width <= 0:
+        return ""
+    out, vis, i, n, truncated = [], 0, 0, len(s), False
+    while i < n:
+        m = _ANSI_CSI_RE.match(s, i)
+        if m:
+            out.append(m.group(0))
+            i = m.end()
+            continue
+        if vis >= width:
+            truncated = True
+            break
+        out.append(s[i])
+        vis += 1
+        i += 1
+    res = ''.join(out)
+    if truncated:
+        res += RESET
+    return res
+
 # tshark protocol stats
 proto_stats = defaultdict(int)
 
@@ -3382,9 +3411,13 @@ def _disp_show_tunnel(parts=None):
     when it's missing, print the exact per-platform install line."""
     parts = parts or []
     if len(parts) > 1 and parts[1] in ("install", "download", "get"):
-        dest = _download_cloudflared()
-        if dest:
-            add_console(f"{DIM}Now run 'restart-tunnel' to start it.{RESET}")
+        # Download is a blocking urlretrieve — run it off the input thread so the
+        # TUI stays responsive (mirrors the daemon parser in _start_cloudflared_tunnel).
+        def _bg():
+            dest = _download_cloudflared()  # already prints progress/status
+            if dest:
+                add_console(f"{DIM}Now run 'restart-tunnel' to start it.{RESET}")
+        threading.Thread(target=_bg, daemon=True).start()
         return
     cf_bin = _find_cloudflared_bin()
     if _tunnel_url:
@@ -5270,6 +5303,7 @@ def _paint_dashboard():
         buf += divider + "\033[K\n"
         for line in visible:
             text = str(line).replace('\n', ' ').replace('\r', '')
+            text = _clip_visible(text, max(1, cols - 2))
             buf += f"  {text}\033[K\n"
         for _ in range(output_panel - len(visible)):
             buf += "\033[K\n"
@@ -5301,6 +5335,7 @@ def _paint_cli():
     buf += f"{DIM}{'─'*min(cols, 78)}{RESET}\033[K\n"
     for line in visible:
         text = str(line).replace('\n', ' ').replace('\r', '')
+        text = _clip_visible(text, max(1, cols - 2))
         buf += f"  {text}\033[K\n"
     for _ in range(body_rows - len(visible)):
         buf += "\033[K\n"
@@ -5328,6 +5363,7 @@ def _paint_console():
     buf += f"{DIM}{'─'*min(cols, 78)}{RESET}\033[K\n"
     for line in visible:
         text = str(line).replace('\n', ' ').replace('\r', '')
+        text = _clip_visible(text, max(1, cols - 2))
         buf += f"  {text}\033[K\n"
     for _ in range(body_rows - len(visible)):
         buf += "\033[K\n"
