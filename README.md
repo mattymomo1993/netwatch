@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/Mattmorris-dev/netwatch-sec/main/docs/netwatch-square.png" alt="NetWatch" width="240">
+  <img src="https://raw.githubusercontent.com/Mattmorris-dev/netwatch-sec/main/docs/banner.png" alt="NetWatch — all-in-one network security dashboard" width="100%">
 </p>
 
 # NetWatch
