@@ -552,10 +552,14 @@ def fake_cam_feed(cam_n=1):
 
 @app.route("/<path:path>", methods=["GET", "POST", "PUT", "DELETE"])
 def catch_all(path):
+    # path / body / user_agent are attacker-controlled and reach the honeypot
+    # summary + TUI render buffer — strip ANSI/control chars at ingestion so a
+    # crafted URL or header can't rewrite the operator's terminal (also keeps
+    # the on-disk event log clean).
     log_event("scan_probe", request.remote_addr, {
-        "method": request.method, "path": f"/{path}",
-        "body": request.get_data(as_text=True)[:500],
-        "user_agent": request.headers.get("User-Agent", ""),
+        "method": request.method, "path": _ansi_strip(f"/{path}"),
+        "body": _ansi_strip(request.get_data(as_text=True))[:500],
+        "user_agent": _ansi_strip(request.headers.get("User-Agent", "")),
     })
     return "404 Not Found", 404
 
@@ -1406,7 +1410,7 @@ def _validate_nmap_flags(scan_type):
 
 def nmap_scan(target, scan_type="-sV -T4"):
     global nmap_running
-    if not re.match(r'^[\d./a-fA-F:\-a-zA-Z]+$', target):
+    if not re.match(r'^[\d./a-fA-F:\-a-zA-Z]+$', target) or target.startswith('-'):
         add_console(f"{RED}Invalid nmap target: {target}{RESET}"); return
     nmap_running = True
 
@@ -2636,7 +2640,10 @@ def banner_grab(target, port):
         s.send(b"HEAD / HTTP/1.0\r\n\r\n")
         banner = s.recv(1024).decode(errors="replace")
         s.close()
-        return banner.strip()[:200]
+        # Strip ANSI/control chars at the source: this banner is attacker-
+        # controlled and flows into alerts, the report file, and the TUI render
+        # buffer. Un-stripped escapes could rewrite the operator's screen.
+        return _ansi_strip(banner).strip()[:200]
     except Exception as e:
         return f"ERROR: {e}"
 
@@ -2768,6 +2775,7 @@ _output_scroll = 0
 _OUTPUT_PANEL_MIN = 6
 _tunnel_url = ""  # populated when cloudflared trycloudflare URL is captured
 _cf_proc = None   # module-level handle so console commands can restart it
+_cf_install_active = False  # guards against concurrent `tunnel install` downloads
 
 # ─── Screen State (AppState dataclass) ───────────────────
 #
@@ -3413,10 +3421,21 @@ def _disp_show_tunnel(parts=None):
     if len(parts) > 1 and parts[1] in ("install", "download", "get"):
         # Download is a blocking urlretrieve — run it off the input thread so the
         # TUI stays responsive (mirrors the daemon parser in _start_cloudflared_tunnel).
+        # Guard against re-entry: concurrent installs would race on the same .tmp.
+        global _cf_install_active
+        if _cf_install_active:
+            add_console(f"{DIM}cloudflared download already in progress…{RESET}")
+            return
+        _cf_install_active = True
+
         def _bg():
-            dest = _download_cloudflared()  # already prints progress/status
-            if dest:
-                add_console(f"{DIM}Now run 'restart-tunnel' to start it.{RESET}")
+            global _cf_install_active
+            try:
+                dest = _download_cloudflared()  # already prints progress/status
+                if dest:
+                    add_console(f"{DIM}Now run 'restart-tunnel' to start it.{RESET}")
+            finally:
+                _cf_install_active = False
         threading.Thread(target=_bg, daemon=True).start()
         return
     cf_bin = _find_cloudflared_bin()
